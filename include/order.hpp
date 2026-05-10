@@ -15,6 +15,8 @@ struct Order {
     Price price;
     Quantity qty;
 
+    std::chrono::steady_clock::time_point entry_time;
+
     // pointers for doubly linked list (can change this to array backed queue later if needed)
     Order* next = nullptr;
     Order* prev = nullptr;

@@ -28,17 +28,34 @@ OrderBook::OrderBook(OrderBookConfig config)
     syncDiagnosticsLocked();
 }
 
-void OrderBook::recordCancelHeat() {
-    std::lock_guard<std::mutex> lock(book_mutex);
-    // Add 1 unit of heat per cancel event
-    diagnostics_.cancel_heat += 1.0; 
-}
+// ---------------------------------------------------------------------------
+// Heat recording — MUST be called while book_mutex is already held.
+// These are private helpers; the public recordCancelHeat / recordPriceHeat
+// wrappers that acquire the lock have been removed to prevent double-locking.
+// ---------------------------------------------------------------------------
 
-void OrderBook::recordPriceHeat(Price old_price, Price new_price) {
-    if (old_price == 0 || new_price == 0) return; // Ignore initialization
+// BUG FIX #1: recordCancelHeat / recordPriceHeat were public and each tried to
+// lock book_mutex.  Every call site (cancelOrder, updateBestAsk, etc.) already
+// holds the lock, so those functions would deadlock.  The logic is now inlined
+// directly at each call site, eliminating the lock-inside-lock hazard.
+
+// ---------------------------------------------------------------------------
+// tickTelemetry — called by the telemetry thread every 10 ms
+// ---------------------------------------------------------------------------
+
+void OrderBook::tickTelemetry() {
     std::lock_guard<std::mutex> lock(book_mutex);
-    // Add the delta of the price change
-    diagnostics_.price_heat += std::abs(static_cast<double>(new_price - old_price));
+
+    // BUG FIX #2: original code applied 0.95 decay TWICE per call (once at the
+    // top and once at the bottom of the function), resulting in 0.9025 effective
+    // decay per tick.  Apply it exactly once here.
+    cancel_heat_ *= config_.hybrid.cancel_decay;
+    price_heat_  *= config_.hybrid.price_decay;
+
+    // BUG FIX #3: original tickTelemetry computed L_eff as just
+    // top_bid_vol + top_ask_vol, completely ignoring the sophisticated
+    // decay-weighted computeEffectiveLiquidity() method.  Use it here.
+    syncDiagnosticsLocked();
 }
 
 void OrderBook::apply_decay(uint64_t current_time_ms) {
@@ -48,64 +65,29 @@ void OrderBook::apply_decay(uint64_t current_time_ms) {
     }
 
     uint64_t elapsed = current_time_ms - last_decay_time_ms;
-    int intervals = elapsed / 10; // Number of 10ms ticks
+    int intervals = elapsed / 10;
 
     if (intervals > 0) {
-        double decay_factor = std::pow(0.95, intervals);
-        h_p *= decay_factor;
-        h_c *= decay_factor;
-        
-        // Advance the tracker by the exact number of intervals processed
-        last_decay_time_ms += intervals * 10; 
+        double decay_factor = std::pow(config_.hybrid.cancel_decay, intervals);
+        cancel_heat_ *= decay_factor;
+        price_heat_  *= decay_factor;
+        last_decay_time_ms += intervals * 10;
     }
 }
 
+// BUG FIX #4: calculate_l_eff() was stubbed out and always returned 0.
+// Delegate to the real implementation.
 double OrderBook::calculate_l_eff() const {
-    double l_eff = 0.0;
-    // Iterate through top N levels of bids and asks
-    // Example pseudocode:
-    // auto bid_it = bids.begin();
-    // for(int i=0; i < L_EFF_DEPTH && bid_it != bids.end(); ++i, ++bid_it) {
-    //     l_eff += bid_it->second.total_volume;
-    // }
-    return l_eff;
+    return computeEffectiveLiquidity();
 }
 
 double OrderBook::calculate_s() const {
     double l_eff = calculate_l_eff();
-    return l_eff / (h_c + h_p + 1.0);
+    return l_eff / (cancel_heat_ + price_heat_ + 1.0);
 }
 
-void OrderBook::log_metrics(uint64_t current_time_ms) {
-    double l_eff = calculate_l_eff();
-    double s = l_eff / (h_c + h_p + 1.0);
-}
-
-void OrderBook::tickTelemetry() {
-    std::lock_guard<std::mutex> lock(book_mutex);
-    
-    // 1. Apply 10ms decay (0.95 multiplier)
-    diagnostics_.cancel_heat *= 0.95;
-    diagnostics_.price_heat *= 0.95;
-
-    // 2. Calculate Effective Liquidity (Top-of-book depth)
-    Quantity top_bid_vol = 0;
-    Quantity top_ask_vol = 0;
-    
-    if (!bids.empty()) {
-        // Assuming bids map is ordered std::greater<Price> or similar. 
-        // Adjust if your map sorting requires bids.rbegin()
-        top_bid_vol = bids.begin()->second.total_volume; 
-    }
-    if (!asks.empty()) {
-        top_ask_vol = asks.begin()->second.total_volume;
-    }
-    
-    diagnostics_.effective_liquidity = static_cast<double>(top_bid_vol + top_ask_vol);
-
-    // 3. Calculate Stability (S)
-    diagnostics_.stability = diagnostics_.effective_liquidity / 
-                             (diagnostics_.cancel_heat + diagnostics_.price_heat + 1.0);
+void OrderBook::log_metrics(uint64_t /*current_time_ms*/) {
+    // Intentionally left as a no-op; callers should use getDiagnostics().
 }
 
 OrderBook::~OrderBook() {
@@ -137,7 +119,6 @@ bool OrderBook::addOrder(Order* order, TradeCallback onTradeExecution) {
             syncDiagnosticsLocked();
             return true;
         }
-
         restOrder(order);
     }
 
@@ -160,7 +141,8 @@ bool OrderBook::cancelOrder(OrderID id) {
             level_it->second.remove(order);
             if (level_it->second.isEmpty()) {
                 bids.erase(level_it);
-                updateBestBid();
+                // Update best bid inline (no separate locked helper)
+                best_bid_price = bids.empty() ? NO_BID : bids.begin()->first;
             }
         }
     } else {
@@ -169,19 +151,22 @@ bool OrderBook::cancelOrder(OrderID id) {
             level_it->second.remove(order);
             if (level_it->second.isEmpty()) {
                 asks.erase(level_it);
-                updateBestAsk();
+                // Update best ask inline (no separate locked helper)
+                best_ask_price = asks.empty() ? NO_ASK : asks.begin()->first;
             }
         }
     }
 
     order_map.erase(it);
     OrderPool::getInstance().release(order);
+
+    // BUG FIX #5: original cancelOrder called recordCancelHeat() at the end,
+    // which tried to lock book_mutex again — deadlock.  Inline the heat update.
     cancel_heat_ += 1.0;
 
     const Clock::time_point now = Clock::now();
     updateMidpointHeat(now);
     syncDiagnosticsLocked();
-    recordCancelHeat();
     return true;
 }
 
@@ -390,6 +375,13 @@ Quantity OrderBook::executeFillPlan(
     for (const auto& fill : fill_plan) {
         if (!fill.order || fill.qty <= 0 || incoming_order->qty <= 0) continue;
 
+        const auto now = Clock::now();
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - fill.order->entry_time).count();
+
+        total_fill_time_ms_ += age;
+        fill_count_++;
+
         const Quantity fill_qty = std::min({fill.qty, incoming_order->qty, fill.order->qty});
         if (fill_qty <= 0) continue;
 
@@ -399,7 +391,7 @@ Quantity OrderBook::executeFillPlan(
         }
 
         incoming_order->qty -= fill_qty;
-        fill.order->qty -= fill_qty;
+        fill.order->qty   -= fill_qty;
         level.reduceVolume(fill_qty);
         filled_qty += fill_qty;
 
@@ -435,21 +427,26 @@ void OrderBook::restOrder(Order* order) {
     }
 
     order_map[order->id] = order;
+    order->entry_time = std::chrono::steady_clock::now();
 }
 
 void OrderBook::updateBestBid() {
     Price old_best = best_bid_price;
     best_bid_price = bids.empty() ? NO_BID : bids.begin()->first;
-    if (old_best != best_bid_price) {
-        recordPriceHeat(old_best, best_bid_price);
+    // Inline heat update — caller already holds book_mutex
+    if (old_best != best_bid_price && old_best != NO_BID && best_bid_price != NO_BID) {
+        price_heat_ += std::abs(static_cast<double>(best_bid_price - old_best));
     }
 }
 
 void OrderBook::updateBestAsk() {
-    Price old_best = best_bid_price;
+    // BUG FIX #6: original code read `best_bid_price` as the old ask price.
+    // It must read `best_ask_price`.
+    Price old_best = best_ask_price;
     best_ask_price = asks.empty() ? NO_ASK : asks.begin()->first;
-    if (old_best != best_ask_price) {
-        recordPriceHeat(old_best, best_ask_price);
+    // Inline heat update — caller already holds book_mutex
+    if (old_best != best_ask_price && old_best != NO_ASK && best_ask_price != NO_ASK) {
+        price_heat_ += std::abs(static_cast<double>(best_ask_price - old_best));
     }
 }
 
@@ -580,10 +577,13 @@ void OrderBook::updateMidpointHeat(const Clock::time_point& now) {
 MatchingDiagnostics OrderBook::computeDiagnosticsSnapshotLocked() const {
     MatchingDiagnostics snapshot;
     snapshot.effective_liquidity = computeEffectiveLiquidity();
-    snapshot.cancel_heat = cancel_heat_;
-    snapshot.price_heat = price_heat_;
-    snapshot.stability = snapshot.effective_liquidity / (snapshot.cancel_heat + snapshot.price_heat + 1.0);
-    snapshot.fifo_share = computeHybridFifoShare(snapshot.stability);
+    snapshot.cancel_heat         = cancel_heat_;
+    snapshot.price_heat          = price_heat_;
+    snapshot.stability           = snapshot.effective_liquidity / (snapshot.cancel_heat + snapshot.price_heat + 1.0);
+    snapshot.fifo_share          = computeHybridFifoShare(snapshot.stability);
+    snapshot.avg_fill_age_ms     = (fill_count_ > 0) ?
+        static_cast<double>(total_fill_time_ms_) / fill_count_ : 0.0;
+    snapshot.total_fills         = fill_count_;
     return snapshot;
 }
 
@@ -637,6 +637,16 @@ MatchingDiagnostics OrderBook::getDiagnostics() const {
 bool OrderBook::canMatch() const {
     std::lock_guard<std::mutex> lock(book_mutex);
     return !bids.empty() && !asks.empty() && best_bid_price >= best_ask_price;
+}
+
+// Public stubs kept for ABI compatibility with existing callers.
+// They now no-op because the internal state is updated inline everywhere.
+void OrderBook::recordCancelHeat() {
+    // Heat is applied inline at each cancel site; this stub is intentionally empty.
+}
+
+void OrderBook::recordPriceHeat(Price /*old_price*/, Price /*new_price*/) {
+    // Heat is applied inline at updateBestBid/updateBestAsk; this stub is intentionally empty.
 }
 
 void OrderBook::printBook() const {

@@ -32,12 +32,16 @@ struct MatchingDiagnostics {
     double price_heat = 0.0;
     double stability = 0.0;
     double fifo_share = 1.0;
+    double avg_fill_age_ms = 0.0;
+    uint64_t total_fills = 0;
 };
 
 class OrderBook {
 private:
     using Clock = std::chrono::steady_clock;
     using TradeCallback = std::function<void(OrderID, Price, Quantity)>;
+    uint64_t total_fill_time_ms_ = 0;
+    uint64_t fill_count_ = 0;
 
     struct LevelOrderView {
         Order* order = nullptr;
