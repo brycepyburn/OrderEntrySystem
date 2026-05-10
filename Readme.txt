@@ -13,6 +13,11 @@ git push : (ensure it is on your branch not main)
 
 do a pr on github.com to merge into main
 
+we trying to stress this so download: 
+(cd to include) mac: curl -LO https://github.com/CrowCpp/Crow/releases/download/v1.0+5/crow_all.h
+brew install boost
+(cd to include) windows: wget https://github.com/CrowCpp/Crow/releases/download/v1.0+5/crow_all.h
+
 
 current dsa ideas:
 
