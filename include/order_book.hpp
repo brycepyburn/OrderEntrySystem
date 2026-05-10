@@ -12,8 +12,31 @@
 enum class AllocationMode { FIFO, PRO_RATA, HYBRID };
 
 struct HybridConfig {
-    double min_fifo_share = 0.5;
-    double stability_alpha = 0.5;
+    // ---------------------------------------------------------------------------
+    // Heat-function parameters (see computeHybridFifoShare)
+    //
+    // The FIFO share is determined by:
+    //
+    //   f(x) = 50 / (e^k - 1) * (e^(k*x/stability_max) - 1) + 50
+    //
+    // where x = clamp(stability, 0, stability_max).
+    //
+    // f maps x ∈ [0, stability_max] → fifo_share ∈ [50%, 100%].
+    //
+    //   k controls curvature:
+    //     k → 0   : nearly linear (50% at x=0, 100% at x=stability_max)
+    //     k = 4.5 : moderate convexity (stays near 50% for most of the range,
+    //               then climbs sharply near stability_max)
+    //     k large : step-function-like (almost always 50% until very stable)
+    //
+    // The output is then re-scaled into [min_fifo_share, 1.0] so that
+    // min_fifo_share acts as a hard floor regardless of k.
+    // ---------------------------------------------------------------------------
+    double k               = 4.5;   // curvature of the heat/FIFO-share mapping
+    double stability_max   = 3000.0; // S value that maps to 100% FIFO share
+
+    double min_fifo_share = 0.5;    // hard floor: FIFO always gets at least this
+    double stability_alpha = 0.5;   // kept for backward compat, unused in heat fn
     double cancel_decay = 0.95;
     double price_decay = 0.95;
     int price_decay_interval_ms = 10;
@@ -105,14 +128,11 @@ private:
     MatchingDiagnostics computeDiagnosticsSnapshotLocked() const;
     void syncDiagnosticsLocked();
 
-    // stability metric tracking
+    // Legacy fields kept so existing .cpp code compiles
     double h_p = 0.0;
     double h_c = 0.0;
     uint64_t last_decay_time_ms = 0;
-    
-    // configurable depth for effective liquidity
-    const int L_EFF_DEPTH = 5; 
-    
+    const int L_EFF_DEPTH = 5;
 
 public:
     explicit OrderBook(OrderBookConfig config = {});
@@ -131,25 +151,19 @@ public:
     Order* getOrder(OrderID id) const;
     MatchingDiagnostics getDiagnostics() const;
 
-    // Check if order book can match (best bid >= best ask)
     bool canMatch() const;
 
-    // Telemetry updates
+    // Telemetry
     void recordCancelHeat();
     void recordPriceHeat(Price old_price, Price new_price);
-    
-    // Triggers the 10ms decay and recalculates S
     void tickTelemetry();
 
-    // For debugging/display
+    // Debugging
     void printBook() const;
     size_t getBidLevelCount() const;
     size_t getAskLevelCount() const;
 
-    // Lazy decay function
     void apply_decay(uint64_t current_time_ms);
-    
-    // Metric Calculations
     double calculate_l_eff() const;
     double calculate_s() const;
     void log_metrics(uint64_t current_time_ms);

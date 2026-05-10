@@ -334,19 +334,55 @@ std::vector<OrderBook::FillInstruction> OrderBook::buildFillPlan(const PriceLeve
     } else if (config_.allocation_mode == AllocationMode::PRO_RATA) {
         fills = allocateProRata(orders, capped_target);
     } else {
+        // ---------------------------------------------------------------------
+        // Hybrid two-phase allocation: FIFO first, then pro-rata on residuals.
+        //
+        // Phase 1 — FIFO slice
+        //   fifo_share (from heat function) determines what fraction of the
+        //   total fill goes to FIFO.  We allocate this front-to-back in queue
+        //   order (oldest order fills first, completely, before the next one
+        //   gets anything).
+        //
+        //   Example: 3 resting orders [A=100, B=100, C=100], incoming 100 lots,
+        //   fifo_share = 0.5 → fifo_target = round(100 * 0.5) = 50 lots.
+        //   allocateFifo gives: A=50, B=0, C=0.
+        //
+        // Phase 2 — pro-rata slice on residuals
+        //   Each resting order's residual qty = original qty − FIFO fill.
+        //   A has residual 50, B has 100, C has 100.  Total residual = 250.
+        //   pro-rata target = 100 − 50 = 50 lots.
+        //   Allocations: A += round(50 * 50/250) = 10,
+        //                B += round(50 * 100/250) = 20,
+        //                C += round(50 * 100/250) = 20.  (remainders distributed by FIFO rank)
+        //   Final: A=60, B=20, C=20.  Sum=100. ✓
+        //
+        // Why round() not ceil():
+        //   ceil always biases FIFO upward.  If fifo_share=0.5 and target=101,
+        //   ceil(50.5)=51 → pro-rata only gets 50.  round(50.5)=51 too in this
+        //   case, but for fifo_share=0.499 and target=100, ceil gives 50 while
+        //   the intent is 49 or 50.  round() is the neutral choice; it gives
+        //   exactly the split the heat function computed.
+        // ---------------------------------------------------------------------
         diagnostics_ = computeDiagnosticsSnapshotLocked();
         const Quantity fifo_target = static_cast<Quantity>(std::clamp(
-            static_cast<int64_t>(std::ceil(static_cast<double>(capped_target) * diagnostics_.fifo_share)),
+            static_cast<int64_t>(std::llround(static_cast<double>(capped_target) * diagnostics_.fifo_share)),
             static_cast<int64_t>(0),
             static_cast<int64_t>(capped_target)));
 
+        // Phase 1: FIFO fills (front-to-back queue priority)
         const auto fifo_fills = allocateFifo(orders, fifo_target);
+
+        // Phase 2: pro-rata on what each order has left after FIFO
         std::vector<LevelOrderView> residual_orders = orders;
         for (size_t i = 0; i < residual_orders.size(); ++i) {
             residual_orders[i].qty -= fifo_fills[i];
+            // qty can't go negative (allocateFifo respects order qty), but clamp for safety
+            if (residual_orders[i].qty < 0) residual_orders[i].qty = 0;
         }
 
-        const auto pro_rata_fills = allocateProRata(residual_orders, capped_target - fifo_target);
+        const Quantity pro_rata_target = capped_target - fifo_target;
+        const auto pro_rata_fills = allocateProRata(residual_orders, pro_rata_target);
+
         for (size_t i = 0; i < fills.size(); ++i) {
             fills[i] = fifo_fills[i] + pro_rata_fills[i];
         }
@@ -529,14 +565,51 @@ double OrderBook::computeEffectiveLiquidity() const {
 }
 
 double OrderBook::computeHybridFifoShare(double stability) const {
-    if (config_.allocation_mode == AllocationMode::FIFO) return 1.0;
+    if (config_.allocation_mode == AllocationMode::FIFO)     return 1.0;
     if (config_.allocation_mode == AllocationMode::PRO_RATA) return 0.0;
 
-    const double floor = config_.hybrid.min_fifo_share;
-    if (config_.hybrid.stability_alpha <= 0.0 || stability <= 0.0) return floor;
+    // -------------------------------------------------------------------------
+    // Heat function from the exchange design spec:
+    //
+    //   f(x) = 50 / (e^k - 1) * (e^(k*x/stability_max) - 1) + 50
+    //
+    // Maps x = clamp(stability, 0, stability_max)
+    //   → f ∈ [50, 100]   (percentage, i.e. 50%..100% FIFO share)
+    //
+    // At x = 0:             f = 50 / (e^k-1) * (1 - 1) + 50  = 50  → 50%
+    // At x = stability_max: f = 50 / (e^k-1) * (e^k - 1) + 50 = 100 → 100%
+    //
+    // k controls curvature:
+    //   k small  → nearly linear ramp from 50% to 100%
+    //   k = 4.5  → moderate convexity; spends most of the range near 50%,
+    //              then climbs sharply as stability approaches stability_max
+    //   k large  → step-like; almost always at the floor until very stable
+    //
+    // The [50, 100] output is then remapped to [min_fifo_share, 1.0] so
+    // that min_fifo_share acts as a hard floor independent of k.
+    // -------------------------------------------------------------------------
+    const double k             = config_.hybrid.k;
+    const double s_max         = std::max(config_.hybrid.stability_max, 1.0);
+    const double floor_share   = config_.hybrid.min_fifo_share;   // e.g. 0.5
 
-    const double growth = 1.0 - std::exp(-config_.hybrid.stability_alpha * stability);
-    return std::clamp(floor + (1.0 - floor) * growth, floor, 1.0);
+    // Clamp stability into [0, stability_max]
+    const double x = std::clamp(stability, 0.0, s_max);
+
+    double pct_fifo;  // result in [50, 100]
+
+    if (std::fabs(k) < 1e-9) {
+        // k ≈ 0: L'Hopital limit → f(x) = 50 * x / s_max + 50 (linear)
+        pct_fifo = 50.0 * x / s_max + 50.0;
+    } else {
+        const double ek = std::exp(k);
+        pct_fifo = (50.0 / (ek - 1.0)) * (std::exp(k * x / s_max) - 1.0) + 50.0;
+    }
+
+    // Remap [50, 100] → [floor_share, 1.0]
+    //   pct=50  → floor_share
+    //   pct=100 → 1.0
+    const double t = (pct_fifo - 50.0) / 50.0;   // t ∈ [0, 1]
+    return std::clamp(floor_share + t * (1.0 - floor_share), floor_share, 1.0);
 }
 
 void OrderBook::applyPriceHeatDecay(const Clock::time_point& now) {

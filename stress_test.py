@@ -1,21 +1,33 @@
 """
-stress_test.py — Multi-agent market simulation
-==============================================
+stress_test.py — Multi-agent market simulation with per-agent PnL tracking
+==========================================================================
 
-Key fix in this version
-------------------------
-Every agent now maintains:
-  _my_order_ids  : set[int]  — IDs the agent has submitted (registered before
-                               the ack arrives, because a fast match can deliver
-                               an execution report before the ack)
-  _pending_qty   : dict[int,int] — remaining qty on each live resting order
+Usage:
+    python stress_test.py [k]
 
-on_execution only logs a fill when the reported order_id is in _my_order_ids.
-When an order is fully filled (pending_qty reaches 0) it is removed from the
-tracking set so the set stays small.
+    k  — heat-function curvature parameter passed to the C++ engine.
+         Defaults to 4.5.  Run multiple times with different k values,
+         then use visualize_pnl.py to compare agent PnL across runs.
 
-This replaces the previous design where every agent received and credited the
-entire global execution tape.
+PnL methodology (mark-to-mid)
+------------------------------
+For each fill an agent receives:
+    BUY fill:   PnL delta = fill_qty * (mid_price - fill_price)
+                  (you acquired shares worth mid, paid fill_price)
+    SELL fill:  PnL delta = fill_qty * (fill_price - mid_price)
+                  (you sold shares worth mid, received fill_price)
+
+mid_price is the best-bid/ask midpoint from the most recent telemetry tick.
+This is a standard microstructure measure — it captures adverse selection
+(paying above mid on aggressive buys) vs. earning the spread (passive sells
+above mid).  It is NOT a realised PnL (we're not netting positions), but it
+correctly shows who is being hurt by the matching algorithm at each k.
+
+Output files
+------------
+  stability_bounds.csv        — telemetry time series
+  whale_events.json           — whale sweep timestamps
+  pnl_k{k}.csv               — per-agent cumulative PnL at each telemetry tick
 """
 
 import asyncio
@@ -23,6 +35,7 @@ import websockets
 import json
 import random
 import csv
+import sys
 import time
 from collections import deque
 
@@ -52,8 +65,11 @@ env = MarketEnvironment(1000)
 whale_events: list[float] = []
 sim_start_time: float = 0.0
 
+# Shared mid-price updated from telemetry (thread-safe: asyncio single-threaded)
+current_mid: float = 1000.0
+
 # ---------------------------------------------------------------------------
-# Global order ID counter (client-side)
+# Global order ID counter
 # ---------------------------------------------------------------------------
 
 _global_order_id = 1_000_000
@@ -70,20 +86,15 @@ def next_order_id() -> int:
 
 class BaseAgent:
     """
-    Connection + message dispatch + per-agent fill tracking.
+    Handles connection, dispatch, fill tracking, and mark-to-mid PnL.
 
-    Fill tracking design
-    --------------------
-    _my_order_ids  : set[int]
-        All order IDs this agent has ever submitted.  Populated *before* the
-        network send so that a fill arriving before the ack is still caught.
+    PnL tracking
+    ------------
+    _order_side[order_id] = 'BUY' | 'SELL'
+        Stored at registration so on_execution knows which direction to PnL.
 
-    _pending_qty   : dict[int, int]
-        Remaining unfilled quantity for each resting order.  Initialised when
-        the order is submitted and decremented on each execution report.  When
-        it hits 0 the ID is removed from _my_order_ids (the order is gone).
-
-    on_execution() only credits a fill when order_id in _my_order_ids.
+    pnl_history: list[(time_sec, cumulative_pnl)]
+        Sampled at each fill event for plotting.
     """
 
     def __init__(self, name: str, sigma: float = 2.0):
@@ -92,28 +103,29 @@ class BaseAgent:
         self.ws      = None
         self.running = True
 
-        # Per-agent fill accounting
+        # Fill accounting
         self.fill_count  = 0
         self.fill_shares = 0
+        self.cumulative_pnl = 0.0
+        self.pnl_history: list[tuple[float, float]] = []
 
-        # Order tracking — populated before send, cleaned up after full fill
+        # Order tracking
         self._my_order_ids: set[int]       = set()
         self._pending_qty:  dict[int, int] = {}
+        self._order_side:   dict[int, str] = {}   # 'BUY' or 'SELL'
 
     def get_perceived_price(self) -> int:
         return max(1, round(np.random.normal(env.fair_price, self.sigma)))
 
-    # ------------------------------------------------------------------
-    # ID registration — call BEFORE sending the order over the wire
-    # ------------------------------------------------------------------
-
-    def _register_order(self, order_id: int, qty: int) -> None:
+    def _register_order(self, order_id: int, qty: int, side: str) -> None:
         self._my_order_ids.add(order_id)
-        self._pending_qty[order_id] = qty
+        self._pending_qty[order_id]  = qty
+        self._order_side[order_id]   = side
 
     def _unregister_order(self, order_id: int) -> None:
         self._my_order_ids.discard(order_id)
         self._pending_qty.pop(order_id, None)
+        self._order_side.pop(order_id, None)
 
     # ------------------------------------------------------------------
     # Connection
@@ -147,7 +159,7 @@ class BaseAgent:
             self.running = False
 
     # ------------------------------------------------------------------
-    # Message dispatch
+    # Dispatch
     # ------------------------------------------------------------------
 
     async def _dispatch(self, msg: dict) -> None:
@@ -165,30 +177,34 @@ class BaseAgent:
     # ------------------------------------------------------------------
 
     async def on_execution(self, msg: dict) -> None:
-        """
-        Credit a fill only if the order_id belongs to this agent.
-
-        The server broadcasts two execution reports per match — one for the
-        incoming order ID, one for the resting order ID.  Only one of them
-        should be in _my_order_ids for any given agent.
-        """
         order_id = msg.get("order_id")
         qty      = msg.get("qty", 0)
+        price    = msg.get("price", 0)
 
         if order_id not in self._my_order_ids:
-            return  # belongs to a different agent
+            return
 
         self.fill_count  += 1
         self.fill_shares += qty
 
-        # Track remaining quantity; remove when fully filled
+        # Mark-to-mid PnL
+        side = self._order_side.get(order_id, "BUY")
+        mid  = current_mid
+        if side == "BUY":
+            self.cumulative_pnl += qty * (mid - price)
+        else:
+            self.cumulative_pnl += qty * (price - mid)
+
+        t = time.time() - sim_start_time
+        self.pnl_history.append((t, self.cumulative_pnl))
+
+        # Qty tracking
         if order_id in self._pending_qty:
             self._pending_qty[order_id] -= qty
             if self._pending_qty[order_id] <= 0:
                 self._unregister_order(order_id)
 
     async def on_order_ack(self, msg: dict) -> None:
-        """If the server rejected the order, stop tracking it."""
         if not msg.get("success", False):
             self._unregister_order(msg.get("id"))
 
@@ -196,14 +212,18 @@ class BaseAgent:
         self._unregister_order(msg.get("id"))
 
     async def on_cancelled(self, msg: dict) -> None:
-        """IOC / market remainder — order is gone."""
         self._unregister_order(msg.get("id"))
 
     async def on_telemetry(self, msg: dict) -> None:
-        pass
+        # Update global mid-price from telemetry
+        global current_mid
+        best_bid = msg.get("best_bid", 0)
+        best_ask = msg.get("best_ask", 0)
+        if best_bid and best_ask and best_ask < 10**15:
+            current_mid = (best_bid + best_ask) / 2.0
 
     # ------------------------------------------------------------------
-    # Sending helpers
+    # Sending
     # ------------------------------------------------------------------
 
     async def send_order(
@@ -215,17 +235,12 @@ class BaseAgent:
         qty:        int,
         order_id:   int | None = None,
     ) -> int:
-        """
-        Register the order ID locally BEFORE sending so a fast execution
-        report that races ahead of the ack is still attributed correctly.
-        Returns the order ID used.
-        """
         if not self.ws or not self.running:
             return -1
         if order_id is None:
             order_id = next_order_id()
 
-        self._register_order(order_id, qty)  # register before wire send
+        self._register_order(order_id, qty, side)
 
         payload = {
             "action": action,
@@ -246,9 +261,13 @@ class BaseAgent:
     async def run(self) -> None:
         pass
 
+    async def _deferred_unregister(self, order_id: int, delay: float) -> None:
+        await asyncio.sleep(delay)
+        self._unregister_order(order_id)
+
 
 # ---------------------------------------------------------------------------
-# DataLogger — telemetry only, no order tracking needed
+# DataLogger
 # ---------------------------------------------------------------------------
 
 class DataLogger(BaseAgent):
@@ -259,10 +278,11 @@ class DataLogger(BaseAgent):
         self.csv_writer.writerow([
             "timestamp", "S", "L_eff", "H_c", "H_p",
             "avg_age", "best_bid", "best_ask", "spread",
-            "bid_levels", "ask_levels",
+            "bid_levels", "ask_levels", "fifo_share", "k",
         ])
 
     async def on_telemetry(self, msg: dict) -> None:
+        await super().on_telemetry(msg)   # updates current_mid
         best_bid = msg.get("best_bid", 0)
         best_ask = msg.get("best_ask", 0)
         spread   = (best_ask - best_bid) if (best_bid and best_ask and best_ask < 10**15) else 0
@@ -278,6 +298,8 @@ class DataLogger(BaseAgent):
             spread,
             msg.get("bid_levels", 0),
             msg.get("ask_levels", 0),
+            msg.get("fifo_share", 1.0),
+            msg.get("k", 4.5),
         ])
         self.csv_file.flush()
 
@@ -299,7 +321,6 @@ class MarketMaker(BaseAgent):
 
     def __init__(self, name: str, sigma: float = 1.0):
         super().__init__(name, sigma)
-        # deque of resting IDs for stale-quote management
         self.live_ids: deque[int] = deque()
 
     async def on_order_ack(self, msg: dict) -> None:
@@ -308,11 +329,9 @@ class MarketMaker(BaseAgent):
             self.live_ids.append(msg["id"])
 
     async def on_execution(self, msg: dict) -> None:
-        order_id = msg.get("order_id")
-        # super() handles fill count + _pending_qty; if order is now gone,
-        # also remove from live_ids
         await super().on_execution(msg)
-        if order_id not in self._my_order_ids:  # fully filled → clean live_ids
+        order_id = msg.get("order_id")
+        if order_id not in self._my_order_ids:   # fully filled
             try:
                 self.live_ids.remove(order_id)
             except ValueError:
@@ -328,7 +347,7 @@ class MarketMaker(BaseAgent):
     async def _cancel_stale(self) -> None:
         while len(self.live_ids) >= self.MAX_LIVE:
             old_id = self.live_ids.popleft()
-            self._unregister_order(old_id)  # stop tracking before ack arrives
+            self._unregister_order(old_id)
             await self.send_cancel(old_id)
             await asyncio.sleep(0.02)
 
@@ -343,7 +362,6 @@ class MarketMaker(BaseAgent):
             ask_id = await self.send_order("new_order", "LIMIT", "SELL",
                                            p + self.HALF_SPREAD, 500)
 
-            # send_order already registered them; add to live_ids for cancel mgmt
             self.live_ids.append(bid_id)
             self.live_ids.append(ask_id)
 
@@ -362,19 +380,13 @@ class RetailTrader(BaseAgent):
             side = random.choice(["BUY", "SELL"])
 
             if random.random() < 0.05:
-                # Rare large marketable limit — aggressive momentum order
                 price = p + 20 if side == "BUY" else p - 20
                 qty   = random.randint(100, 500)
                 await self.send_order("new_order", "LIMIT", side, price, qty)
             else:
                 qty = random.randint(1, 20)
                 oid = await self.send_order("new_order", "MARKET", side, 0, qty)
-                # Market orders don't rest; clean up after fills can arrive
                 asyncio.create_task(self._deferred_unregister(oid, delay=0.15))
-
-    async def _deferred_unregister(self, order_id: int, delay: float) -> None:
-        await asyncio.sleep(delay)
-        self._unregister_order(order_id)
 
 
 # ---------------------------------------------------------------------------
@@ -387,16 +399,9 @@ class HFTSniper(BaseAgent):
             p = self.get_perceived_price()
             bid_id = await self.send_order("new_order", "LIMIT", "BUY",  p - 1, 1)
             ask_id = await self.send_order("new_order", "LIMIT", "SELL", p + 1, 1)
-
-            # 1-lot orders fill almost instantly or become stale; give 200ms
             asyncio.create_task(self._deferred_unregister(bid_id, 0.2))
             asyncio.create_task(self._deferred_unregister(ask_id, 0.2))
-
             await asyncio.sleep(0.05)
-
-    async def _deferred_unregister(self, order_id: int, delay: float) -> None:
-        await asyncio.sleep(delay)
-        self._unregister_order(order_id)
 
 
 # ---------------------------------------------------------------------------
@@ -414,10 +419,6 @@ class WhaleTrader(BaseAgent):
             oid = await self.send_order("new_order", "MARKET", side, 0, 3000)
             asyncio.create_task(self._deferred_unregister(oid, delay=0.5))
 
-    async def _deferred_unregister(self, order_id: int, delay: float) -> None:
-        await asyncio.sleep(delay)
-        self._unregister_order(order_id)
-
 
 # ---------------------------------------------------------------------------
 # Simulation driver
@@ -431,7 +432,7 @@ async def price_driver() -> None:
         await asyncio.sleep(0.1)
 
 
-async def main() -> None:
+async def main(k_value: float) -> None:
     global sim_start_time
     sim_start_time = time.time()
 
@@ -443,7 +444,6 @@ async def main() -> None:
 
     asyncio.create_task(price_driver())
 
-    # Phase 1: seed the book
     print("=== Phase 1: Warmup ===")
     await logger.connect()
     asyncio.create_task(logger.run())
@@ -454,7 +454,6 @@ async def main() -> None:
     print(f"  Waiting {WARMUP_SECONDS}s for quotes to accumulate…")
     await asyncio.sleep(WARMUP_SECONDS)
 
-    # Phase 2: aggressive agents
     print("=== Phase 2: Simulation Running ===")
     for agent in retail + snipers + [whale]:
         await agent.connect()
@@ -467,15 +466,39 @@ async def main() -> None:
     logger.close()
     with open("whale_events.json", "w") as f:
         json.dump(whale_events, f)
-    print("Data saved to stability_bounds.csv and whale_events.json")
 
+    # ------------------------------------------------------------------
+    # Save per-agent PnL time series for this k run
+    # ------------------------------------------------------------------
+    k_str = str(k_value).replace(".", "_")
+    pnl_filename = f"pnl_k{k_str}.csv"
     all_agents = makers + retail + snipers + [whale]
+
+    with open(pnl_filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["agent", "role", "time_sec", "cumulative_pnl"])
+        for agent in all_agents:
+            role = (
+                "MarketMaker" if isinstance(agent, MarketMaker) else
+                "RetailTrader" if isinstance(agent, RetailTrader) else
+                "HFTSniper"   if isinstance(agent, HFTSniper)   else
+                "Whale"
+            )
+            for t, pnl in agent.pnl_history:
+                writer.writerow([agent.name, role, round(t, 3), round(pnl, 4)])
+
+    print(f"PnL data saved to {pnl_filename}")
+    print("Telemetry saved to stability_bounds.csv")
+
     print("\n--- Fill summary (own orders only) ---")
     for agent in all_agents:
         avg = (agent.fill_shares / agent.fill_count) if agent.fill_count else 0
         print(f"  {agent.name:15s}: {agent.fill_count:5d} fills, "
-              f"{agent.fill_shares:8d} shares, avg {avg:6.1f} shares/fill")
+              f"{agent.fill_shares:8d} shares, avg {avg:6.1f} shs/fill, "
+              f"PnL {agent.cumulative_pnl:+.1f}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    k_arg = float(sys.argv[1]) if len(sys.argv) >= 2 else 4.5
+    print(f"Running simulation with k = {k_arg}")
+    asyncio.run(main(k_arg))

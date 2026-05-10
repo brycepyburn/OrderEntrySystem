@@ -25,16 +25,34 @@ std::set<crow::websocket::connection*> active_connections;
 // mutex.  The fix: remove the external mutex entirely.  The OrderBook is already
 // thread-safe.
 
-int main() {
+int main(int argc, char* argv[]) {
     crow::SimpleApp app;
 
-    // Pure FIFO simulation — switch to AllocationMode::HYBRID to see the
-    // adaptive FIFO/pro-rata split respond to stability in real time.
+    // -----------------------------------------------------------------------
+    // k controls the curvature of the FIFO-share heat function:
+    //   f(x) = 50/(e^k - 1) * (e^(kx/stability_max) - 1) + 50
+    //
+    // Pass k as the first command-line argument, e.g.:
+    //   ./matching_engine 1.0    # nearly linear
+    //   ./matching_engine 4.5    # default moderate convexity
+    //   ./matching_engine 9.0    # step-like, mostly pro-rata until very stable
+    // -----------------------------------------------------------------------
+    double k_param = 4.5;
+    if (argc >= 2) {
+        try {
+            k_param = std::stod(argv[1]);
+            std::cout << "Heat function k = " << k_param << std::endl;
+        } catch (...) {
+            std::cerr << "Invalid k argument, using default 4.5" << std::endl;
+        }
+    }
+
     OrderBookConfig config;
-    config.allocation_mode = AllocationMode::FIFO;
-    // Use at least 5 depth levels so computeEffectiveLiquidity has something
-    // to work with across the whole book.
-    config.hybrid.depth_levels = 5;
+    config.allocation_mode       = AllocationMode::HYBRID;
+    config.hybrid.k              = k_param;
+    config.hybrid.stability_max  = 3000.0;
+    config.hybrid.min_fifo_share = 0.5;
+    config.hybrid.depth_levels   = 5;
     OrderBook book(config);
 
     // std::atomic ensures unique, sequential IDs across concurrent WebSocket threads.
@@ -174,7 +192,7 @@ int main() {
     // Fix: call tickTelemetry() exactly once per 10 ms sleep, always.
     // Only read diagnostics (no extra tick) when it's time to broadcast.
     // -----------------------------------------------------------------------
-    std::thread telemetry_thread([&book]() {
+    std::thread telemetry_thread([&book, k_param]() {
         int tick_counter = 0;
 
         while (true) {
@@ -205,6 +223,8 @@ int main() {
             msg["best_ask"]       = book.getBestAsk();
             msg["bid_levels"]     = static_cast<int>(book.getBidLevelCount());
             msg["ask_levels"]     = static_cast<int>(book.getAskLevelCount());
+            msg["fifo_share"]     = diag.fifo_share;
+            msg["k"]              = k_param;
 
             std::string payload = msg.dump();
             std::lock_guard<std::mutex> lock(connections_mutex);
