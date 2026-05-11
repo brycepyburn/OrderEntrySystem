@@ -473,7 +473,6 @@ async def main(k_value: float) -> None:
     k_str = str(k_value).replace(".", "_")
     pnl_filename = f"pnl_k{k_str}.csv"
     all_agents = makers + retail + snipers + [whale]
-
     with open(pnl_filename, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["agent", "role", "time_sec", "cumulative_pnl"])
