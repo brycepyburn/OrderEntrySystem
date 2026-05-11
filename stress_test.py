@@ -496,7 +496,11 @@ async def main(k_value: float) -> None:
               f"{agent.fill_shares:8d} shares, avg {avg:6.1f} shs/fill, "
               f"PnL {agent.cumulative_pnl:+.1f}")
 
-
+import glob, os
+for f in glob.glob("pnl_k*.csv"):
+    os.remove(f)
+    print(f"Removed stale {f}")
+    
 if __name__ == "__main__":
     k_arg = float(sys.argv[1]) if len(sys.argv) >= 2 else 4.5
     print(f"Running simulation with k = {k_arg}")

@@ -256,7 +256,8 @@ for f in pnl_files:
         continue
     df_pnl = pd.read_csv(f)
     stem    = f.stem   # e.g. pnl_k4_5
-    k_label = "k=" + stem.replace("pnl_k", "").replace("_", ".")
+    k_val = df_pnl["k"].iloc[0] if "k" in df_pnl.columns else stem.replace("pnl_k", "").replace("_", ".")
+    k_label = f"k={k_val}"
     pnl_data[k_label] = df_pnl
     print(f"Loaded PnL file: {f}  ({k_label})")
 
