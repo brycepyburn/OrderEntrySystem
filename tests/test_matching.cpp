@@ -56,7 +56,9 @@ Order* makeOrder(
 }
 
 bool submitOrder(OrderBook& book, Order* order, std::vector<Trade>& trades) {
-    auto callback = [&](OrderID order_id, Price price, Quantity qty) {
+    // mid_at_fill added to match updated TradeCallback signature.
+    // Tests don't need the mid value so it's ignored here.
+    auto callback = [&](OrderID order_id, Price price, Quantity qty, double /*mid_at_fill*/) {
         trades.push_back(Trade{order_id, price, qty});
     };
 

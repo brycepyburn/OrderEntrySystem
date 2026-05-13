@@ -108,6 +108,12 @@ bool OrderBook::addOrder(Order* order, TradeCallback onTradeExecution) {
         return false;
     }
 
+    // Capture the current midpoint BEFORE matching so that last_midpoint_
+    // reflects the book state at the moment of the trade, not after it.
+    // The callback fires during matchIncomingOrder and reads last_midpoint_
+    // to compute zero-sum PnL — it must be current at that point.
+    updateMidpointHeat(now);
+
     const Quantity filled_qty = matchIncomingOrder(order, onTradeExecution);
     if (filled_qty > 0) {
         cancel_heat_ *= config_.hybrid.cancel_decay;
@@ -115,14 +121,12 @@ bool OrderBook::addOrder(Order* order, TradeCallback onTradeExecution) {
 
     if (order->qty > 0) {
         if (order->type == OrderType::MARKET || order->tif == TimeInForce::IOC) {
-            updateMidpointHeat(now);
             syncDiagnosticsLocked();
             return true;
         }
         restOrder(order);
     }
 
-    updateMidpointHeat(now);
     syncDiagnosticsLocked();
     return true;
 }
@@ -177,12 +181,14 @@ void OrderBook::match(Order* incoming_order, TradeCallback onTradeExecution) {
     const Clock::time_point now = Clock::now();
     applyPriceHeatDecay(now);
 
+    // Capture mid before matching — same reasoning as addOrder.
+    updateMidpointHeat(now);
+
     const Quantity filled_qty = matchIncomingOrder(incoming_order, onTradeExecution);
     if (filled_qty > 0) {
         cancel_heat_ *= config_.hybrid.cancel_decay;
     }
 
-    updateMidpointHeat(now);
     syncDiagnosticsLocked();
 }
 
@@ -422,8 +428,15 @@ Quantity OrderBook::executeFillPlan(
         if (fill_qty <= 0) continue;
 
         if (onTradeExecution) {
-            onTradeExecution(incoming_order->id, price, fill_qty);
-            onTradeExecution(fill.order->id, price, fill_qty);
+            // Use last_midpoint_ (set just before matchIncomingOrder) as the
+            // reference price for zero-sum PnL attribution.
+            // If the book was one-sided and midpoint_valid_ is false, fall back
+            // to the fill price — this makes PnL = 0 for both sides, which is
+            // honest: we don't know the fair value so we don't attribute anything.
+            const double mid_for_pnl = midpoint_valid_ ? last_midpoint_
+                                                       : static_cast<double>(price);
+            onTradeExecution(incoming_order->id, price, fill_qty, mid_for_pnl);
+            onTradeExecution(fill.order->id,     price, fill_qty, mid_for_pnl);
         }
 
         incoming_order->qty -= fill_qty;

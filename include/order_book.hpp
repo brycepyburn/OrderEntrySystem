@@ -62,7 +62,7 @@ struct MatchingDiagnostics {
 class OrderBook {
 private:
     using Clock = std::chrono::steady_clock;
-    using TradeCallback = std::function<void(OrderID, Price, Quantity)>;
+    using TradeCallback = std::function<void(OrderID, Price, Quantity, double /*mid_at_fill*/)>;
     uint64_t total_fill_time_ms_ = 0;
     uint64_t fill_count_ = 0;
 

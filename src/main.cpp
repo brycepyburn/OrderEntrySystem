@@ -37,18 +37,37 @@ int main(int argc, char* argv[]) {
     //   ./matching_engine 4.5    # default moderate convexity
     //   ./matching_engine 9.0    # step-like, mostly pro-rata until very stable
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // CLI args:
+    //   argv[1]  k value      (default 4.5)  — heat function curvature
+    //   argv[2]  mode string  (default "hybrid") — "fifo" | "prorata" | "hybrid"
+    //
+    // Examples:
+    //   ./matching_engine 4.5 hybrid
+    //   ./matching_engine 0   fifo
+    // -----------------------------------------------------------------------
     double k_param = 4.5;
+    std::string mode_str = "hybrid";
+
     if (argc >= 2) {
         try {
             k_param = std::stod(argv[1]);
-            std::cout << "Heat function k = " << k_param << std::endl;
         } catch (...) {
             std::cerr << "Invalid k argument, using default 4.5" << std::endl;
         }
     }
+    if (argc >= 3) {
+        mode_str = argv[2];
+    }
+
+    AllocationMode alloc_mode = AllocationMode::HYBRID;
+    if (mode_str == "fifo")    alloc_mode = AllocationMode::FIFO;
+    if (mode_str == "prorata") alloc_mode = AllocationMode::PRO_RATA;
+
+    std::cout << "Mode: " << mode_str << "  k=" << k_param << std::endl;
 
     OrderBookConfig config;
-    config.allocation_mode       = AllocationMode::HYBRID;
+    config.allocation_mode       = alloc_mode;
     config.hybrid.k              = k_param;
     config.hybrid.stability_max  = 3000.0;
     config.hybrid.min_fifo_share = 0.5;
@@ -129,12 +148,16 @@ int main(int argc, char* argv[]) {
               o->qty   = qty;
 
               // Broadcast execution reports to all connected clients.
-              auto trade_callback = [id](OrderID order_id, Price match_price, Quantity fill_qty) {
+              // mid_at_fill is the midpoint captured inside the book at match time —
+              // the same value for both sides of the trade, guaranteeing zero-sum PnL.
+              auto trade_callback = [](OrderID order_id, Price match_price,
+                                       Quantity fill_qty, double mid_at_fill) {
                   crow::json::wvalue msg;
                   msg["type"]     = "execution";
                   msg["order_id"] = order_id;
                   msg["price"]    = match_price;
                   msg["qty"]      = fill_qty;
+                  msg["mid"]      = mid_at_fill;
                   std::string report = msg.dump();
                   std::lock_guard<std::mutex> lock(connections_mutex);
                   for (auto* c : active_connections) {
@@ -192,7 +215,7 @@ int main(int argc, char* argv[]) {
     // Fix: call tickTelemetry() exactly once per 10 ms sleep, always.
     // Only read diagnostics (no extra tick) when it's time to broadcast.
     // -----------------------------------------------------------------------
-    std::thread telemetry_thread([&book, k_param]() {
+    std::thread telemetry_thread([&book, k_param, mode_str]() {
         int tick_counter = 0;
 
         while (true) {
@@ -225,6 +248,7 @@ int main(int argc, char* argv[]) {
             msg["ask_levels"]     = static_cast<int>(book.getAskLevelCount());
             msg["fifo_share"]     = diag.fifo_share;
             msg["k"]              = k_param;
+            msg["mode"]           = mode_str;
 
             std::string payload = msg.dump();
             std::lock_guard<std::mutex> lock(connections_mutex);

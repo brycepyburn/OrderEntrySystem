@@ -1,546 +1,718 @@
 """
-visualize.py — Unified post-simulation dashboard
-=================================================
+visualize.py  —  Single entry point for all charts
+====================================================
 
-Produces two saved figures from a single run:
+Run this after every stress_test.py run.  It detects what data is present
+and produces whichever charts are possible.
 
-  simulation_dashboard.png   — 6-panel market microstructure view
-  pnl_comparison.png         — per-agent cumulative PnL across k values
+PHASE 1  (k-sweep)
+  Run stress_test.py for each k value you want to compare.
+  Each run appends one row to experiment_results.csv.
+  Then run this script — it makes:
+    sweep_stability.png   avg_S vs k  (whale + no-whale)
+    sweep_pnl.png         avg PnL per role vs k
+
+PHASE 2  (FIFO vs best-k comparison)
+  After picking the best k from Phase 1, run the engine in FIFO mode too.
+  Then run this script again — it additionally makes:
+    compare_stability.png  avg_S bar chart: FIFO vs best-k
+    compare_pnl.png        agent PnL bar chart: FIFO vs best-k
+    dashboard.png          6-panel microstructure view (last run's telemetry)
+    agent_pnl.png          cumulative PnL time series (last run's pnl_k*.csv)
 
 Usage
 -----
-    # After running stress_test.py (one or more k values):
-    python visualize.py
+    python visualize.py                    # auto-detect everything
+    python visualize.py --best-k 2        # force which k is "best" for Phase 2
+    python visualize.py --dashboard-only  # only make the dashboard + agent PnL
+    python visualize.py --sweep-only      # only make the k-sweep charts
 
-Data files expected in the working directory
---------------------------------------------
-  stability_bounds.csv   — telemetry from the most recent run (always present)
-  whale_events.json      — whale sweep timestamps (optional)
-  pnl_k*.csv            — one per k value, e.g. pnl_k4_5.csv, pnl_k3_0.csv
-                           Auto-detected by glob; at least one required for the
-                           PnL figure.  If none found, that figure is skipped.
+Workflow reminder
+-----------------
+  # Phase 1 — k sweep (repeat for k = 0,1,2,3,4,5)
+  ./matching_engine {k} hybrid
+  python stress_test.py {k} --no-whale
+  # stop engine between runs
 
---------------------------------------------------------------------------------
-WHAT THE CODE DOES — end-to-end overview
---------------------------------------------------------------------------------
+  python visualize.py          ← run after all k values done
 
-C++ matching engine (order_book.cpp / main.cpp)
-  A limit order book implemented as two std::map<Price, PriceLevel> — one for
-  bids (descending) and one for asks (ascending).  Each PriceLevel holds a
-  doubly-linked list of resting orders.
+  # Phase 2 — comparison (pick best_k from charts above)
+  ./matching_engine {best_k} hybrid
+  python stress_test.py {best_k} --no-whale
 
-  Allocation modes
-    FIFO      Oldest order at a price level fills completely before the next
-              one gets anything.  Rewards patience and queue position.
-    PRO_RATA  Every resting order fills in proportion to its size.  Rewards
-              large orders; queue position doesn't matter.
-    HYBRID    A blend whose FIFO fraction is determined by the heat function
-              (see below).  The book is more FIFO when stable, more pro-rata
-              when stressed.
+  ./matching_engine 0 fifo
+  python stress_test.py 0 --fifo --no-whale
 
-  Heat function  f(x) = 50/(e^k - 1) · (e^(kx/3000) - 1) + 50
-    x = clamp(stability S, 0, 3000)
-    Maps S ∈ [0, 3000] → FIFO% ∈ [50%, 100%].
-
-    k controls curvature:
-      k ≈ 0  : linear — FIFO% rises steadily as stability improves
-      k = 3  : moderately convex — FIFO% stays near 50% until S > ~1500,
-               then climbs quickly
-      k = 4.5: strongly convex — market must be very stable to earn >60% FIFO
-      k large: step-like — essentially pure pro-rata until stability is
-               very high, then switches to pure FIFO
-
-    Economic interpretation:  high k means the engine behaves like a pro-rata
-    market most of the time, only granting FIFO priority during calm periods.
-    This redistributes fill probability from large queue-position holders (MMs,
-    HFT) toward smaller orders placed at any time (retail).
-
-  Stability metric  S = L_eff / (H_c + H_p + 1)
-    L_eff  Effective liquidity — sum of resting volume at the top N price
-           levels on each side, decay-weighted by distance from best price
-           and divided by sqrt(order_count) to penalise thin, fragmented books.
-    H_c    Cancel heat — increments by 1 on every cancel, decays by 0.95 per
-           10 ms tick.  High H_c means many orders are being withdrawn, which
-           typically signals adverse selection or a stale-quote purge.
-    H_p    Price heat — increments by |Δmidpoint| on every midpoint move, same
-           decay.  High H_p means the fair value is shifting rapidly (news,
-           whale sweep).
-    The denominator (H_c + H_p + 1) grows when the market is stressed, driving
-    S toward 0.  The +1 prevents division-by-zero when both heats are zero.
-
-  Two-phase hybrid allocation (FIFO then pro-rata)
-    1. fifo_target  = round(fill_qty × fifo_share)      ← from heat function
-    2. allocateFifo(orders, fifo_target)                 ← front-to-back
-    3. residual_qty per order = original_qty − fifo_fill
-    4. allocateProRata(residuals, fill_qty − fifo_target) ← proportional
-
-    Pro-rata integer rounding: base fill = floor(target × order_qty / total_qty).
-    Remainder shares (from fractional truncation) are distributed one-by-one to
-    the orders with the largest fractional remainder, with FIFO rank as tiebreak.
-    This is the standard exchange algorithm — no share is ever lost or invented.
-
-Python stress_test.py
-  Runs N simulated agents over WebSocket against the C++ engine:
-    MarketMaker   Posts passive two-sided quotes ±2 ticks around perceived mid.
-                  Cancels stale orders (tracks live IDs).  Earns the spread
-                  on passive fills; loses when adversely selected.
-    RetailTrader  Sends small random market orders.  Occasionally sends a
-                  large marketable limit (momentum trade).  Pays the spread
-                  on aggressive fills.
-    HFTSniper     Posts 1-lot limit orders ±1 tick at high frequency (50 ms).
-                  Tries to be inside the MM spread; fills are tiny but frequent.
-    WhaleTrader   Sends 3000-lot market orders every 10–20 s.  Each sweep
-                  clears multiple price levels, causing spread to widen, S to
-                  drop, and H_p to spike.
-
-  Mark-to-mid PnL  (per fill)
-    BUY:  PnL += fill_qty × (mid_price − fill_price)
-    SELL: PnL += fill_qty × (fill_price − mid_price)
-    mid_price is the (best_bid + best_ask) / 2 from the most recent telemetry.
-
-    This is an instantaneous adverse-selection measure, NOT realised PnL.
-    Positive → the agent received a price better than fair value (passive fills,
-               or aggressive buys below mid).
-    Negative → the agent paid away from fair value (crossing the spread to buy,
-               or selling into a falling market).
-
---------------------------------------------------------------------------------
-WHAT THE GRAPHS MEAN
---------------------------------------------------------------------------------
-
-Simulation dashboard (Figure 1)
-  Panel 1 — Stability S
-    High S = deep, calm book.  Dips sharply at whale sweeps (L_eff collapses
-    and H_p spikes simultaneously, so both numerator and denominator move
-    against S).  Recovery speed shows how quickly MMs re-quote.
-
-  Panel 2 — Effective Liquidity L_eff
-    Volume-weighted depth of the top levels, discounted by distance from best
-    price.  Drops after sweeps, grows during quiet MM quoting periods.
-    The slow decay in the middle of your run reflects MMs' stale-quote
-    cancellation draining the book before re-quoting at new prices.
-
-  Panel 3 — Heat variables H_c and H_p
-    H_c spikes when MMs cancel stale quotes en masse after a price move.
-    H_p spikes directly at whale sweeps (midpoint jumps).  The two heats
-    are often correlated — a price move triggers cancellations.
-    Both decay at 0.95 per 10 ms → half-life ≈ 130 ms.
-
-  Panel 4 — Avg fill age
-    How long (in ms) resting orders waited before being filled, averaged over
-    all fills so far.  This is a FIFO efficiency metric: in pure FIFO the
-    oldest order fills first, so the average age grows as volume builds up.
-    A rising trend means older orders are being filled (good FIFO behaviour).
-    A flat trend means fills are spread across ages (pro-rata-like).
-
-  Panel 5 — Bid-ask spread
-    best_ask − best_bid in ticks.  Normal spread = 4 ticks (MMs quote ±2).
-    Spikes at whale sweeps when the best levels are wiped and the next resting
-    quote is further away.  Recovery time measures MM re-quoting speed.
-
-  Panel 6 — Book depth (price level count)
-    Number of distinct price levels on each side.  Grows as MMs and HFT post
-    quotes at many different prices.  Drops at sweeps (levels consumed), then
-    grows again.  A large, asymmetric depth (many bid levels, few ask levels)
-    suggests directional pressure from recent flow.
-
-Agent PnL comparison (Figure 2)
-  Each row is one agent role; each column is one k value.
-  The curves show cumulative mark-to-mid PnL over 60 seconds.
-
-  Market Makers
-    Should be positive on average — they earn the half-spread on every passive
-    fill.  The asymmetry between MM_0 and MM_1 reflects queue position and
-    timing luck.  At high k (more FIFO), the first MM to post at a price level
-    earns a larger fraction of fills, so the leading MM PnL is higher.  At low k
-    (more pro-rata), fills are shared more evenly across all MMs.
-
-  Retail Traders
-    Typically negative — they mostly send market orders, paying the spread.
-    Occasional large limit orders that fill passively can produce positive blips.
-    Less sensitive to k because they rarely compete for queue position.
-
-  HFT Snipers
-    Consistently negative because they post 1-lot orders ±1 tick inside the MM
-    spread.  When they fill passively they earn 1 tick, but they also
-    frequently get adversely selected (filled on the wrong side of a price move).
-    At high k, their tiny orders are at a queue disadvantage behind larger MM
-    orders at the same price; at low k, they get a proportional share.
-
-  Whale
-    Large negative PnL — each 3000-lot market sweep crosses the spread (paying
-    several ticks per share on average), hence a large one-time loss at each
-    dashed vertical line.  The whale doesn't care about microstructure efficiency;
-    its cost shows the true market impact of aggressive size.
-
-  How k shifts the distribution
-    Increasing k → more pro-rata in stressed conditions → MMs share fills more
-    evenly → leader MM PnL decreases, lagging MM PnL increases → HFT orders get
-    a fair share proportional to their size (but size is tiny, so it doesn't help
-    much) → retail fills are unaffected (they're mostly market orders anyway).
-
-    Decreasing k (more FIFO) → queue position dominates → the first MM to post
-    at the best price captures most of the passive fill flow → stronger
-    incentive to quote aggressively, which tightens spread → better for retail
-    (tighter spread they cross) but higher adverse selection risk for late MMs.
+  python visualize.py --best-k {best_k}   ← run once more
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
 
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
-import matplotlib.ticker as mticker
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
-# ===========================================================================
-# Shared helpers
-# ===========================================================================
+# ============================================================================
+# CLI args
+# ============================================================================
 
-WHALE_COLOR = "#f78166"
-GRID_ALPHA  = 0.15
-LW          = 1.2   # default line width
+parser = argparse.ArgumentParser(add_help=True)
+parser.add_argument("--best-k",       type=float, default=None,
+                    help="Force which k value is treated as 'best' for comparison charts")
+parser.add_argument("--dashboard-only", action="store_true",
+                    help="Only produce dashboard.png and agent_pnl.png")
+parser.add_argument("--sweep-only",     action="store_true",
+                    help="Only produce sweep_stability.png and sweep_pnl.png")
+args = parser.parse_args()
 
-def style_axes(axes_list):
-    for ax in axes_list:
-        ax.set_facecolor("#161b22")
-        ax.tick_params(colors="#8b949e", labelsize=8)
-        ax.yaxis.label.set_color("#8b949e")
-        ax.xaxis.label.set_color("#8b949e")
-        ax.title.set_color("#e6edf3")
-        for spine in ax.spines.values():
-            spine.set_edgecolor("#30363d")
+# ============================================================================
+# Shared style
+# ============================================================================
 
-def add_whale_lines(ax, whale_times):
-    for t in whale_times:
-        ax.axvline(t, color=WHALE_COLOR, linestyle="--", linewidth=0.9, alpha=0.7)
+BG_FIG   = "#0d1117"
+BG_PANEL = "#161b22"
+C_GRID   = "#30363d"
+C_TEXT   = "#8b949e"
+C_TITLE  = "#e6edf3"
 
-# ---------------------------------------------------------------------------
-# Load shared data files
-# ---------------------------------------------------------------------------
+WHALE_COLOR  = "#f78166"
+FIFO_COLOR   = "#e3b341"
+BEST_COLOR   = "#3fb950"
+NOWH_COLOR   = "#58a6ff"
 
-# Telemetry
-try:
-    tel = pd.read_csv("stability_bounds.csv")
-    if tel.empty:
-        raise ValueError("empty")
+ROLE_COLORS = {
+    "MarketMaker":  "#58a6ff",
+    "HFTSniper":    "#d2a8ff",
+    "RetailTrader": "#3fb950",
+    "Whale":        "#f85149",
+}
+PNL_COLS = {
+    "mm_pnl":     ("MarketMaker",  "#58a6ff"),
+    "hft_pnl":    ("HFTSniper",    "#d2a8ff"),
+    "retail_pnl": ("RetailTrader", "#3fb950"),
+}
+
+LW       = 1.4
+GRID_A   = 0.15
+
+
+def style_fig(fig):
+    fig.patch.set_facecolor(BG_FIG)
+
+
+def style_ax(ax, title="", ylabel="", xlabel=""):
+    ax.set_facecolor(BG_PANEL)
+    ax.tick_params(colors=C_TEXT, labelsize=8)
+    for lbl in ax.get_xticklabels() + ax.get_yticklabels():
+        lbl.set_color(C_TEXT)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(C_GRID)
+    ax.grid(True, alpha=GRID_A, color=C_TEXT)
+    if title:  ax.set_title(title,  color=C_TITLE, fontsize=9)
+    if ylabel: ax.set_ylabel(ylabel, color=C_TEXT,  fontsize=8)
+    if xlabel: ax.set_xlabel(xlabel, color=C_TEXT,  fontsize=8)
+
+
+def legend(ax, **kw):
+    lg = ax.legend(fontsize=7, facecolor=BG_PANEL, edgecolor=C_GRID,
+                   labelcolor=C_TITLE, **kw)
+    return lg
+
+
+def save(fig, fname):
+    fig.tight_layout()
+    fig.savefig(fname, dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    print(f"  Saved  {fname}")
+    plt.close(fig)
+
+
+def add_vline(ax, x, label=None):
+    ax.axvline(x, color=BEST_COLOR, linewidth=1.0,
+               linestyle="--", alpha=0.8, label=label)
+
+
+def whale_lines(ax, times):
+    for t in times:
+        ax.axvline(t, color=WHALE_COLOR, linestyle="--",
+                   linewidth=0.8, alpha=0.6)
+
+
+# ============================================================================
+# Load data
+# ============================================================================
+
+# --- experiment_results.csv (one row per stress_test run) ---
+results_path = Path("experiment_results.csv")
+if results_path.exists():
+    exp = pd.read_csv(results_path)
+    exp["k"]     = exp["k"].astype(float)
+    exp["whale"] = exp["whale"].astype(str).str.lower().isin(["true","1","yes"])
+    print(f"Loaded experiment_results.csv  ({len(exp)} rows)")
+    print(exp[["mode","k","whale","avg_S","mm_pnl","hft_pnl","retail_pnl"]].to_string(index=False))
+else:
+    exp = pd.DataFrame()
+    print("experiment_results.csv not found — sweep charts will be skipped")
+
+# --- pnl_k*.csv files for detailed time-series PnL ---
+pnl_files   = sorted(Path(".").glob("pnl_k*.csv"))
+pnl_data    = {}
+for f in pnl_files:
+    df_p = pd.read_csv(f)
+    # k label from the data itself (most reliable) or filename fallback
+    if "k" in df_p.columns:
+        k_val = df_p["k"].iloc[0] if not df_p.empty else "?"
+    else:
+        k_val = f.stem.replace("pnl_k","").replace("_",".")
+    # mode label
+    mode_val = df_p["mode"].iloc[0] if "mode" in df_p.columns else "hybrid"
+    label = f"{mode_val}  k={k_val}"
+    pnl_data[label] = df_p
+    print(f"Loaded {f.name}  →  {label}")
+
+# --- stability_bounds.csv from the most recent run ---
+tel_path = Path("stability_bounds.csv")
+if tel_path.exists():
+    tel = pd.read_csv(tel_path)
     tel["time_sec"] = (tel["timestamp"] - tel["timestamp"].iloc[0]) / 1000.0
-    has_telemetry = True
-except (FileNotFoundError, ValueError) as e:
-    print(f"Warning: stability_bounds.csv not loaded ({e}). Dashboard will be skipped.")
-    has_telemetry = False
+    print(f"Loaded stability_bounds.csv  ({len(tel)} rows)")
+else:
     tel = pd.DataFrame()
+    print("stability_bounds.csv not found — dashboard will be skipped")
 
-# Whale events
+# --- whale event timestamps ---
 whale_times: list[float] = []
 try:
-    with open("whale_events.json") as f:
-        whale_times = json.load(f)
-    print(f"Loaded {len(whale_times)} whale event(s).")
+    with open("whale_events.json") as wf:
+        whale_times = json.load(wf)
+    print(f"Loaded {len(whale_times)} whale event(s)")
 except FileNotFoundError:
-    print("whale_events.json not found — whale annotations skipped.")
+    pass
 
-# PnL files (auto-detect pnl_k*.csv in working dir, or take CLI args)
-if len(sys.argv) >= 2:
-    pnl_files = [Path(p) for p in sys.argv[1:]]
-else:
-    pnl_files = sorted(Path(".").glob("pnl_k*.csv"))
+# ============================================================================
+# Determine best k  (argmax avg_S on no-whale hybrid rows)
+# ============================================================================
 
-pnl_data: dict[str, pd.DataFrame] = {}
-for f in pnl_files:
-    if not f.exists():
-        print(f"Warning: {f} not found — skipping.")
-        continue
-    df_pnl = pd.read_csv(f)
-    stem    = f.stem   # e.g. pnl_k4_5
-    k_val = df_pnl["k"].iloc[0] if "k" in df_pnl.columns else stem.replace("pnl_k", "").replace("_", ".")
-    k_label = f"k={k_val}"
-    pnl_data[k_label] = df_pnl
-    print(f"Loaded PnL file: {f}  ({k_label})")
+best_k = args.best_k
 
-has_pnl = len(pnl_data) > 0
-if not has_pnl:
-    print("No pnl_k*.csv files found — PnL figure will be skipped.")
+if best_k is None and not exp.empty:
+    nowh_hybrid = exp[(exp["mode"] == "hybrid") & (~exp["whale"])]
+    if not nowh_hybrid.empty:
+        best_k = float(nowh_hybrid.groupby("k")["avg_S"].mean().idxmax())
+        print(f"\nAuto-detected best k = {best_k}  (max avg_S, no-whale hybrid)")
 
-if not has_telemetry and not has_pnl:
-    print("Nothing to plot. Run stress_test.py first.")
-    sys.exit(1)
+has_fifo    = not exp.empty and (exp["mode"] == "fifo").any()
+has_hybrid  = not exp.empty and (exp["mode"] == "hybrid").any()
+has_sweep   = has_hybrid
+has_compare = has_fifo and has_hybrid and best_k is not None
+
+print(f"\nCharts available:  sweep={has_sweep}  compare={has_compare}  "
+      f"dashboard={not tel.empty}  agent_pnl={len(pnl_data)>0}")
 
 
-# ===========================================================================
-# FIGURE 1 — Simulation Dashboard
-# ===========================================================================
+# ============================================================================
+# PHASE 1 CHARTS — k sweep
+# ============================================================================
 
-if has_telemetry:
-    fig1, axes1 = plt.subplots(6, 1, figsize=(14, 20), sharex=True)
-    fig1.patch.set_facecolor("#0d1117")
-    style_axes(axes1)
+if has_sweep and not args.dashboard_only:
+
+    hybrid = exp[exp["mode"] == "hybrid"]
+    k_vals = sorted(hybrid["k"].unique())
 
     # -----------------------------------------------------------------------
-    # Panel 1 — Stability S
+    # sweep_stability.png  —  avg_S vs k
     # -----------------------------------------------------------------------
-    ax = axes1[0]
+    fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
+    style_fig(fig)
+
+    ax = axes[0]
+    style_ax(ax, title="Average Stability vs k",
+             ylabel="avg_S  =  L_eff / (H_c + H_p + 1)")
+
+    for whale_cond, color, label in [
+        (False, NOWH_COLOR,    "Hybrid — no whale"),
+        (True,  WHALE_COLOR,   "Hybrid — with whale"),
+    ]:
+        sub = hybrid[hybrid["whale"] == whale_cond]
+        if sub.empty: continue
+        g = sub.groupby("k")["avg_S"].agg(["mean","std"]).reindex(k_vals)
+        ax.errorbar(g.index, g["mean"], yerr=g["std"].fillna(0),
+                    color=color, linewidth=LW, marker="o", markersize=6,
+                    capsize=4, label=label, zorder=3)
+        ax.fill_between(g.index,
+                        g["mean"] - g["std"].fillna(0),
+                        g["mean"] + g["std"].fillna(0),
+                        alpha=0.10, color=color)
+
+    # FIFO baselines
+    for whale_cond, color, ls in [(False, NOWH_COLOR,"--"),(True, WHALE_COLOR,"--")]:
+        frow = exp[(exp["mode"]=="fifo") & (exp["whale"]==whale_cond)]
+        if not frow.empty:
+            ax.axhline(frow["avg_S"].mean(), color=color,
+                       linewidth=1.0, linestyle=ls, alpha=0.55,
+                       label=f"FIFO baseline ({'whale' if whale_cond else 'no whale'})")
+
+    if best_k is not None:
+        add_vline(ax, best_k, label=f"Best k = {best_k}")
+    ax.set_xticks(k_vals)
+    legend(ax)
+
+    # --- decomposition panel ---
+    ax2 = axes[1]
+    style_ax(ax2, title="Stability decomposition (no-whale hybrid)",
+             ylabel="Component value",
+             xlabel="k  (heat-function curvature)")
+
+    nowh = hybrid[~hybrid["whale"]]
+    for col, color, label in [
+        ("avg_L_eff", "#3fb950", "L_eff  (liquidity — numerator)"),
+        ("avg_H_c",   "#f85149", "H_c   (cancel heat — denominator)"),
+        ("avg_H_p",   FIFO_COLOR, "H_p   (price heat — denominator)"),
+    ]:
+        if col not in nowh.columns or nowh.empty: continue
+        g = nowh.groupby("k")[col].mean().reindex(k_vals)
+        ax2.plot(g.index, g.values, color=color, linewidth=LW,
+                 marker="s", markersize=4, label=label)
+
+    # FIFO component baselines
+    for col, color in [("avg_L_eff","#3fb950"),("avg_H_c","#f85149"),("avg_H_p",FIFO_COLOR)]:
+        fr = exp[(exp["mode"]=="fifo") & (~exp["whale"])]
+        if col in fr.columns and not fr.empty:
+            ax2.axhline(fr[col].mean(), color=color,
+                        linewidth=0.8, linestyle=":", alpha=0.45)
+
+    if best_k is not None:
+        add_vline(ax2, best_k)
+    ax2.set_xticks(k_vals)
+    legend(ax2)
+
+    fig.suptitle("K-Sweep — How curvature k affects stability and its components",
+                 color=C_TITLE, fontsize=11, y=1.002)
+    save(fig, "sweep_stability.png")
+
+    # -----------------------------------------------------------------------
+    # sweep_pnl.png  —  avg PnL per role vs k  (no-whale only)
+    # -----------------------------------------------------------------------
+    nowh_h = hybrid[~hybrid["whale"]]
+    avail_pnl_cols = {k: v for k, v in PNL_COLS.items() if k in nowh_h.columns}
+
+    if avail_pnl_cols and not nowh_h.empty:
+        fig, axes = plt.subplots(len(avail_pnl_cols), 1,
+                                 figsize=(11, 3.5 * len(avail_pnl_cols)),
+                                 sharex=True)
+        style_fig(fig)
+        if len(avail_pnl_cols) == 1:
+            axes = [axes]
+
+        fifo_nowh = exp[(exp["mode"]=="fifo") & (~exp["whale"])]
+
+        for ax, (col, (role, color)) in zip(axes, avail_pnl_cols.items()):
+            style_ax(ax, title=f"{role} — avg PnL vs k",
+                     ylabel="avg PnL  (ticks · shares)")
+            g = nowh_h.groupby("k")[col].agg(["mean","std"]).reindex(k_vals)
+            ax.plot(g.index, g["mean"], color=color, linewidth=LW,
+                    marker="o", markersize=6, label=f"{role} — hybrid")
+            ax.fill_between(g.index,
+                            g["mean"] - g["std"].fillna(0),
+                            g["mean"] + g["std"].fillna(0),
+                            alpha=0.12, color=color)
+            ax.axhline(0, color=C_TEXT, linewidth=0.6, linestyle=":")
+
+            # FIFO baseline
+            if col in fifo_nowh.columns and not fifo_nowh.empty:
+                ax.axhline(fifo_nowh[col].mean(), color=FIFO_COLOR,
+                           linewidth=1.0, linestyle="--", alpha=0.7,
+                           label="FIFO baseline")
+
+            if best_k is not None:
+                add_vline(ax, best_k, label=f"Best k={best_k}")
+            ax.yaxis.set_major_formatter(
+                mticker.FuncFormatter(lambda v, _: f"{v:+.0f}"))
+            legend(ax)
+
+        axes[-1].set_xlabel("k  (heat-function curvature)",
+                            fontsize=8, color=C_TEXT)
+        axes[-1].set_xticks(k_vals)
+
+        fig.suptitle(
+            "K-Sweep — Agent PnL vs k  (no-whale)\n"
+            "PnL = Σ fill_qty × (mid − fill_price) buys  /  (fill_price − mid) sells",
+            color=C_TITLE, fontsize=10, y=1.002)
+        save(fig, "sweep_pnl.png")
+    else:
+        print("  No PnL columns in experiment_results.csv — sweep_pnl.png skipped")
+
+
+# ============================================================================
+# PHASE 2 CHARTS — FIFO vs best-k comparison
+# ============================================================================
+
+if has_compare and not args.sweep_only and not args.dashboard_only:
+
+    fifo_nowh  = exp[(exp["mode"]=="fifo")   & (~exp["whale"])]
+    opt_nowh   = exp[(exp["mode"]=="hybrid") & (~exp["whale"]) & (exp["k"]==best_k)]
+    fifo_whale = exp[(exp["mode"]=="fifo")   & ( exp["whale"])]
+    opt_whale  = exp[(exp["mode"]=="hybrid") & ( exp["whale"]) & (exp["k"]==best_k)]
+
+    # -----------------------------------------------------------------------
+    # compare_stability.png  —  grouped bar: FIFO vs best-k, whale vs no-whale
+    # -----------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(9, 5))
+    style_fig(fig)
+    style_ax(ax, title=f"Stability: FIFO vs Hybrid k={best_k}",
+             ylabel="Average Stability  S")
+
+    groups   = ["No whale", "With whale"]
+    fifo_s   = [fifo_nowh["avg_S"].mean(),  fifo_whale["avg_S"].mean()]
+    fifo_e   = [fifo_nowh["avg_S"].std(),   fifo_whale["avg_S"].std()]
+    opt_s    = [opt_nowh["avg_S"].mean(),   opt_whale["avg_S"].mean()]
+    opt_e    = [opt_nowh["avg_S"].std(),    opt_whale["avg_S"].std()]
+
+    x     = np.arange(len(groups))
+    width = 0.35
+
+    def bar_group(ax, x, vals, errs, color, label):
+        bars = ax.bar(x, vals, width, color=color, alpha=0.85,
+                      edgecolor=C_GRID, linewidth=0.5, label=label,
+                      yerr=[e if not np.isnan(e) else 0 for e in errs],
+                      capsize=5, error_kw={"ecolor": C_TEXT, "linewidth": 1})
+        for bar, val in zip(bars, vals):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width()/2,
+                        bar.get_height() + 1,
+                        f"{val:.1f}", ha="center", va="bottom",
+                        color=C_TITLE, fontsize=8)
+        return bars
+
+    bar_group(ax, x - width/2, fifo_s, fifo_e, FIFO_COLOR,  "FIFO")
+    bar_group(ax, x + width/2, opt_s,  opt_e,  BEST_COLOR,  f"Hybrid k={best_k}")
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, color=C_TEXT, fontsize=9)
+    legend(ax)
+
+    fig.suptitle(f"Stability Comparison — FIFO vs Hybrid k={best_k}",
+                 color=C_TITLE, fontsize=11, y=1.002)
+    save(fig, "compare_stability.png")
+
+    # -----------------------------------------------------------------------
+    # compare_pnl.png  —  grouped bar: PnL by role, FIFO vs best-k
+    # -----------------------------------------------------------------------
+    avail = {k: v for k, v in PNL_COLS.items()
+             if k in fifo_nowh.columns and k in opt_nowh.columns}
+
+    if avail:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        style_fig(fig)
+        style_ax(ax, title=f"Agent PnL: FIFO vs Hybrid k={best_k}  (no whale)",
+                 ylabel="avg PnL  (ticks · shares)")
+
+        roles   = list(avail.keys())
+        xlabels = [avail[r][0] for r in roles]
+        x       = np.arange(len(roles))
+
+        fifo_v  = [fifo_nowh[r].mean() for r in roles]
+        opt_v   = [opt_nowh[r].mean()  for r in roles]
+
+        for xpos, color, vals, label in [
+            (x - width/2, FIFO_COLOR, fifo_v, "FIFO"),
+            (x + width/2, BEST_COLOR, opt_v,  f"Hybrid k={best_k}"),
+        ]:
+            bars = ax.bar(xpos, vals, width, color=color, alpha=0.85,
+                          edgecolor=C_GRID, linewidth=0.5, label=label)
+            for bar, val in zip(bars, vals):
+                if not np.isnan(val):
+                    offset = abs(val) * 0.04 if val != 0 else 1
+                    va     = "bottom" if val >= 0 else "top"
+                    y      = val + (offset if val >= 0 else -offset)
+                    ax.text(bar.get_x() + bar.get_width()/2, y,
+                            f"{val:+.0f}", ha="center", va=va,
+                            color=C_TITLE, fontsize=8)
+
+        ax.axhline(0, color=C_TEXT, linewidth=0.7)
+        ax.set_xticks(x)
+        ax.set_xticklabels(xlabels, color=C_TEXT, fontsize=9)
+        ax.yaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda v, _: f"{v:+.0f}"))
+        legend(ax)
+
+        fig.suptitle(
+            f"PnL Comparison — FIFO vs Hybrid k={best_k}  (no whale)\n"
+            "Who gains and who loses when the allocation mode changes?",
+            color=C_TITLE, fontsize=10, y=1.002)
+        save(fig, "compare_pnl.png")
+
+
+# ============================================================================
+# DASHBOARD  —  6-panel microstructure (most recent run's telemetry)
+# ============================================================================
+
+if not tel.empty and not args.sweep_only:
+
+    fig, axes = plt.subplots(6, 1, figsize=(14, 20), sharex=True)
+    style_fig(fig)
+
+    k_val    = tel["k"].iloc[-1]    if "k"    in tel.columns else "?"
+    mode_val = tel["mode"].iloc[-1] if "mode" in tel.columns else "hybrid"
+
+    panels = [
+        # (col,      color,     fill,  title)
+        ("S",       "#58a6ff", True,
+         "Stability   S = L_eff / (H_c + H_p + 1)"),
+        ("L_eff",   "#3fb950", True,
+         "Effective Liquidity  L_eff  (decay-weighted top-N depth)"),
+        (None,      None,      False,
+         "Heat Variables  —  H_c cancel heat,  H_p price heat"),
+        ("avg_age", "#d2a8ff", False,
+         "Avg Fill Age (ms)  — time resting orders wait before filling"),
+        ("spread",  "#ffa657", True,
+         "Bid-Ask Spread  (ticks)  — normal = 4 ticks (MM ±2)"),
+        (None,      None,      False,
+         "Book Depth  (distinct resting price levels per side)"),
+    ]
+
+    for i, ax in enumerate(axes):
+        style_ax(axes[i])
+        axes[i].title.set_color(C_TITLE)
+        axes[i].title.set_fontsize(8.5)
+
+    # Panel 0 — Stability
+    ax = axes[0]
+    ax.set_title(panels[0][3], color=C_TITLE, fontsize=8.5)
     ax.plot(tel["time_sec"], tel["S"], color="#58a6ff", linewidth=LW)
-    ax.fill_between(tel["time_sec"], tel["S"], alpha=0.15, color="#58a6ff")
-    ax.set_title("Order Book Stability   S = L_eff / (H_c + H_p + 1)", fontsize=9)
-    ax.set_ylabel("S", fontsize=8)
-    ax.grid(True, alpha=GRID_ALPHA, color="#8b949e")
-    add_whale_lines(ax, whale_times)
-
-    # Annotate current fifo_share on the right y-axis if available
+    ax.fill_between(tel["time_sec"], tel["S"], alpha=0.14, color="#58a6ff")
+    ax.set_ylabel("S", color=C_TEXT, fontsize=8)
+    # FIFO share on right axis
     if "fifo_share" in tel.columns:
         ax2 = ax.twinx()
         ax2.plot(tel["time_sec"], tel["fifo_share"] * 100,
-                 color="#e3b341", linewidth=0.8, alpha=0.6, linestyle=":")
-        ax2.set_ylabel("FIFO share %", fontsize=7, color="#e3b341")
-        ax2.tick_params(colors="#e3b341", labelsize=7)
+                 color=FIFO_COLOR, linewidth=0.9, linestyle=":", alpha=0.7)
+        ax2.set_ylabel("FIFO share %", color=FIFO_COLOR, fontsize=7)
+        ax2.tick_params(colors=FIFO_COLOR, labelsize=7)
         ax2.set_ylim(45, 105)
-        for spine in ax2.spines.values():
-            spine.set_edgecolor("#30363d")
+        for sp in ax2.spines.values(): sp.set_edgecolor(C_GRID)
+    whale_lines(ax, whale_times)
+    ax.grid(True, alpha=GRID_A, color=C_TEXT)
 
-    # -----------------------------------------------------------------------
-    # Panel 2 — Effective Liquidity
-    # -----------------------------------------------------------------------
-    ax = axes1[1]
+    # Panel 1 — L_eff
+    ax = axes[1]
+    ax.set_title(panels[1][3], color=C_TITLE, fontsize=8.5)
     ax.plot(tel["time_sec"], tel["L_eff"], color="#3fb950", linewidth=LW)
     ax.fill_between(tel["time_sec"], tel["L_eff"], alpha=0.12, color="#3fb950")
-    ax.set_title("Effective Liquidity   L_eff  (decay-weighted top-N depth, penalised by √order_count)", fontsize=9)
-    ax.set_ylabel("Volume", fontsize=8)
-    ax.grid(True, alpha=GRID_ALPHA, color="#8b949e")
-    add_whale_lines(ax, whale_times)
+    ax.set_ylabel("Volume", color=C_TEXT, fontsize=8)
+    whale_lines(ax, whale_times)
+    ax.grid(True, alpha=GRID_A, color=C_TEXT)
 
-    # -----------------------------------------------------------------------
-    # Panel 3 — Heat variables
-    # -----------------------------------------------------------------------
-    ax = axes1[2]
-    ax.plot(tel["time_sec"], tel["H_c"],
-            label="Cancel heat  H_c  (+1 per cancel, ×0.95 per 10 ms)", color="#f85149", linewidth=LW)
-    ax.plot(tel["time_sec"], tel["H_p"],
-            label="Price heat   H_p  (+|Δmid| per tick, ×0.95 per 10 ms)", color="#e3b341", linewidth=LW)
-    ax.set_title("Heat Variables — measure of market stress (half-life ≈ 130 ms)", fontsize=9)
-    ax.legend(fontsize=7, facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3")
-    ax.grid(True, alpha=GRID_ALPHA, color="#8b949e")
-    add_whale_lines(ax, whale_times)
+    # Panel 2 — Heat
+    ax = axes[2]
+    ax.set_title(panels[2][3], color=C_TITLE, fontsize=8.5)
+    ax.plot(tel["time_sec"], tel["H_c"], color="#f85149", linewidth=LW,
+            label="H_c  cancel heat  (+1/cancel, ×0.95/10ms)")
+    ax.plot(tel["time_sec"], tel["H_p"], color=FIFO_COLOR, linewidth=LW,
+            label="H_p  price heat   (+|Δmid|, ×0.95/10ms)")
+    legend(ax)
+    whale_lines(ax, whale_times)
+    ax.grid(True, alpha=GRID_A, color=C_TEXT)
 
-    # -----------------------------------------------------------------------
-    # Panel 4 — Avg fill age
-    # -----------------------------------------------------------------------
-    ax = axes1[3]
+    # Panel 3 — Avg fill age
+    ax = axes[3]
+    ax.set_title(panels[3][3], color=C_TITLE, fontsize=8.5)
     ax.plot(tel["time_sec"], tel["avg_age"], color="#d2a8ff", linewidth=LW)
-    ax.set_title("Avg Fill Age (ms)  — time resting orders wait before filling (FIFO efficiency indicator)", fontsize=9)
-    ax.set_ylabel("ms", fontsize=8)
-    ax.grid(True, alpha=GRID_ALPHA, color="#8b949e")
-    add_whale_lines(ax, whale_times)
+    ax.set_ylabel("ms", color=C_TEXT, fontsize=8)
+    whale_lines(ax, whale_times)
+    ax.grid(True, alpha=GRID_A, color=C_TEXT)
 
-    # -----------------------------------------------------------------------
-    # Panel 5 — Bid-ask spread
-    # -----------------------------------------------------------------------
-    ax = axes1[4]
+    # Panel 4 — Spread
+    ax = axes[4]
+    ax.set_title(panels[4][3], color=C_TITLE, fontsize=8.5)
     if "spread" in tel.columns:
         valid = tel[tel["spread"].between(1, 500)]
-        ax.plot(valid["time_sec"], valid["spread"], color="#ffa657", linewidth=LW)
-        ax.fill_between(valid["time_sec"], valid["spread"], alpha=0.12, color="#ffa657")
-        ax.set_title("Bid-Ask Spread  (best_ask − best_bid in ticks)  — normal = 4 ticks (MM ±2)", fontsize=9)
-        ax.set_ylabel("Ticks", fontsize=8)
+        ax.plot(valid["time_sec"], valid["spread"],
+                color="#ffa657", linewidth=LW)
+        ax.fill_between(valid["time_sec"], valid["spread"],
+                        alpha=0.12, color="#ffa657")
+        ax.axhline(4, color="#3fb950", linewidth=0.7, linestyle=":",
+                   alpha=0.6, label="Normal spread (4 ticks)")
+        ax.set_ylabel("Ticks", color=C_TEXT, fontsize=8)
         ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-        # Draw normal-spread reference line
-        ax.axhline(4, color="#3fb950", linewidth=0.7, linestyle=":", alpha=0.6, label="Normal spread (4 ticks)")
-        ax.legend(fontsize=7, facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3")
-    else:
-        ax.text(0.5, 0.5, "spread column not in CSV — re-run stress_test.py",
-                ha="center", va="center", transform=ax.transAxes, color="#8b949e", fontsize=9)
-        ax.set_title("Bid-Ask Spread", fontsize=9)
-    ax.grid(True, alpha=GRID_ALPHA, color="#8b949e")
-    add_whale_lines(ax, whale_times)
+        legend(ax)
+    whale_lines(ax, whale_times)
+    ax.grid(True, alpha=GRID_A, color=C_TEXT)
 
-    # -----------------------------------------------------------------------
-    # Panel 6 — Book depth
-    # -----------------------------------------------------------------------
-    ax = axes1[5]
-    if "bid_levels" in tel.columns and "ask_levels" in tel.columns:
+    # Panel 5 — Depth
+    ax = axes[5]
+    ax.set_title(panels[5][3], color=C_TITLE, fontsize=8.5)
+    if "bid_levels" in tel.columns:
         ax.plot(tel["time_sec"], tel["bid_levels"],
-                label="Bid levels (buy side)", color="#3fb950", linewidth=LW)
+                color="#3fb950", linewidth=LW, label="Bid levels")
         ax.plot(tel["time_sec"], tel["ask_levels"],
-                label="Ask levels (sell side)", color="#f85149", linewidth=LW)
-        ax.set_title("Book Depth  (distinct resting price levels per side)", fontsize=9)
-        ax.set_ylabel("Levels", fontsize=8)
-        ax.legend(fontsize=7, facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3")
+                color="#f85149", linewidth=LW, label="Ask levels")
+        ax.set_ylabel("Levels", color=C_TEXT, fontsize=8)
         ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-    else:
-        ax.text(0.5, 0.5, "bid_levels/ask_levels not in CSV — re-run stress_test.py",
-                ha="center", va="center", transform=ax.transAxes, color="#8b949e", fontsize=9)
-        ax.set_title("Book Depth", fontsize=9)
-    ax.grid(True, alpha=GRID_ALPHA, color="#8b949e")
-    add_whale_lines(ax, whale_times)
+        legend(ax)
+    whale_lines(ax, whale_times)
+    ax.grid(True, alpha=GRID_A, color=C_TEXT)
 
-    axes1[-1].set_xlabel("Time (seconds)", fontsize=9, color="#8b949e")
+    axes[-1].set_xlabel("Time (seconds)", color=C_TEXT, fontsize=9)
 
-    # Figure-level legend
-    legend_handles = []
+    # Figure legend
+    handles = []
     if whale_times:
-        legend_handles.append(
-            mlines.Line2D([], [], color=WHALE_COLOR, linestyle="--",
-                          linewidth=0.9, label="Whale sweep"))
+        handles.append(mlines.Line2D([], [], color=WHALE_COLOR, linestyle="--",
+                                     linewidth=0.9, label="Whale sweep"))
     if "fifo_share" in tel.columns:
-        legend_handles.append(
-            mlines.Line2D([], [], color="#e3b341", linestyle=":",
-                          linewidth=0.8, label="FIFO share % (right axis, panel 1)"))
-    if legend_handles:
-        fig1.legend(handles=legend_handles, loc="upper right",
-                    facecolor="#161b22", edgecolor="#30363d",
-                    labelcolor="#e6edf3", fontsize=8)
+        handles.append(mlines.Line2D([], [], color=FIFO_COLOR, linestyle=":",
+                                     linewidth=0.9, label="FIFO share % (right axis)"))
+    if handles:
+        fig.legend(handles=handles, loc="upper right",
+                   facecolor=BG_PANEL, edgecolor=C_GRID,
+                   labelcolor=C_TITLE, fontsize=8)
 
-    k_val = tel["k"].iloc[-1] if "k" in tel.columns else "?"
-    fig1.suptitle(
-        f"Matching Engine — Market Microstructure Dashboard   (k = {k_val})\n"
-        "Dashed red lines = whale sweeps | dotted yellow = live FIFO share %",
-        color="#e6edf3", fontsize=11, y=1.002)
-
-    plt.figure(fig1.number)
-    plt.tight_layout()
-    fig1.savefig("simulation_dashboard.png", dpi=150, bbox_inches="tight",
-                 facecolor=fig1.get_facecolor())
-    print("Saved: simulation_dashboard.png")
+    fig.suptitle(
+        f"Simulation Dashboard  —  mode={mode_val}  k={k_val}\n"
+        "6-panel market microstructure view of the most recent run",
+        color=C_TITLE, fontsize=11, y=1.002)
+    save(fig, "dashboard.png")
 
 
-# ===========================================================================
-# FIGURE 2 — Agent PnL comparison
-# ===========================================================================
+# ============================================================================
+# AGENT PnL  —  cumulative PnL time series from pnl_k*.csv files
+# ============================================================================
 
-if has_pnl:
-    ROLES       = ["MarketMaker", "RetailTrader", "HFTSniper", "Whale"]
-    ROLE_LABELS = ["Market Maker", "Retail Trader", "HFT Sniper", "Whale"]
-    ROLE_COLORS = {
-        "MarketMaker":  ["#58a6ff", "#1f77b4", "#4682b4"],
-        "RetailTrader": ["#3fb950", "#2ca02c", "#006400", "#32cd32", "#228b22"],
-        "HFTSniper":    ["#d2a8ff", "#9467bd", "#7b68ee"],
-        "Whale":        ["#f85149"],
-    }
-    K_COLORS = ["#ffa657", "#58a6ff", "#3fb950", "#d2a8ff", "#f85149", "#e3b341"]
+if pnl_data and not args.sweep_only:
+
+    # Detect which roles are actually present across all files
+    all_roles_present = set()
+    for df_p in pnl_data.values():
+        all_roles_present.update(df_p["role"].unique())
+
+    ROLES_ORDER  = ["MarketMaker","RetailTrader","HFTSniper","Whale"]
+    ROLES_LABELS = {"MarketMaker":"Market Maker","RetailTrader":"Retail Trader",
+                    "HFTSniper":"HFT Sniper","Whale":"Whale"}
+    roles_to_plot = [r for r in ROLES_ORDER if r in all_roles_present]
 
     n_k    = len(pnl_data)
-    n_rows = len(ROLES) + 1   # +1 for final-PnL bar summary
+    n_rows = len(roles_to_plot) + 1   # +1 for final-PnL bar summary
 
-    fig2, axes2 = plt.subplots(n_rows, n_k,
-                               figsize=(max(7 * n_k, 10), 3.8 * n_rows),
-                               squeeze=False)
-    fig2.patch.set_facecolor("#0d1117")
-    style_axes(axes2.flat)
+    K_COL  = ["#ffa657","#58a6ff","#3fb950","#d2a8ff","#f85149","#e3b341","#ff7b72"]
 
-    # -----------------------------------------------------------------------
-    # Per-role PnL time series (rows 0..3)
-    # -----------------------------------------------------------------------
-    for col_idx, (k_label, df) in enumerate(pnl_data.items()):
-        col_color = K_COLORS[col_idx % len(K_COLORS)]
+    fig, axes = plt.subplots(n_rows, n_k,
+                             figsize=(max(7*n_k, 9), 3.8*n_rows),
+                             squeeze=False)
+    style_fig(fig)
+    for ax in axes.flat:
+        ax.set_facecolor(BG_PANEL)
+        ax.tick_params(colors=C_TEXT, labelsize=7)
+        for sp in ax.spines.values(): sp.set_edgecolor(C_GRID)
 
-        for row_idx, (role, role_label) in enumerate(zip(ROLES, ROLE_LABELS)):
-            ax = axes2[row_idx][col_idx]
-            role_df = df[df["role"] == role]
+    PALETTE = {
+        "MarketMaker":  ["#58a6ff","#1f77b4","#4682b4"],
+        "RetailTrader": ["#3fb950","#2ca02c","#006400","#32cd32","#228b22"],
+        "HFTSniper":    ["#d2a8ff","#9467bd","#7b68ee"],
+        "Whale":        ["#f85149"],
+    }
+
+    for col_i, (label, df_p) in enumerate(pnl_data.items()):
+        col_color = K_COL[col_i % len(K_COL)]
+
+        # Time series rows
+        for row_i, role in enumerate(roles_to_plot):
+            ax = axes[row_i][col_i]
+            role_df = df_p[df_p["role"] == role]
+            palette = PALETTE.get(role, ["#58a6ff"])
 
             if role_df.empty:
                 ax.text(0.5, 0.5, "No data", ha="center", va="center",
-                        transform=ax.transAxes, color="#8b949e", fontsize=8)
+                        transform=ax.transAxes, color=C_TEXT, fontsize=8)
             else:
-                palette = ROLE_COLORS.get(role, ["#58a6ff"])
-                for agent_idx, (agent_name, agent_df) in enumerate(
-                        role_df.groupby("agent", sort=True)):
-                    color = palette[agent_idx % len(palette)]
-                    ax.plot(agent_df["time_sec"], agent_df["cumulative_pnl"],
-                            label=agent_name, color=color,
-                            linewidth=1.2, alpha=0.9)
-                ax.axhline(0, color="#8b949e", linewidth=0.6, linestyle=":")
-                add_whale_lines(ax, whale_times)
-                ax.legend(fontsize=6, facecolor="#161b22", edgecolor="#30363d",
-                          labelcolor="#e6edf3", loc="upper left")
+                for a_i, (aname, adf) in enumerate(role_df.groupby("agent", sort=True)):
+                    ax.plot(adf["time_sec"], adf["cumulative_pnl"],
+                            color=palette[a_i % len(palette)],
+                            linewidth=1.2, alpha=0.9, label=aname)
+                ax.axhline(0, color=C_TEXT, linewidth=0.5, linestyle=":")
+                whale_lines(ax, whale_times)
+                ax.legend(fontsize=6, facecolor=BG_PANEL, edgecolor=C_GRID,
+                          labelcolor=C_TITLE, loc="upper left")
 
-            if row_idx == 0:
-                ax.set_title(k_label, color=col_color, fontsize=11, fontweight="bold")
-
+            if row_i == 0:
+                ax.set_title(label, color=col_color, fontsize=10,
+                             fontweight="bold")
             ax.set_ylabel(
-                f"{role_label}\nCum. PnL (ticks·shares)" if col_idx == 0 else "",
-                color="#8b949e", fontsize=7)
+                f"{ROLES_LABELS[role]}\nCum. PnL" if col_i == 0 else "",
+                color=C_TEXT, fontsize=7)
             ax.yaxis.set_major_formatter(
                 mticker.FuncFormatter(lambda v, _: f"{v:+.0f}"))
-            ax.grid(True, alpha=GRID_ALPHA, color="#8b949e")
+            ax.grid(True, alpha=GRID_A, color=C_TEXT)
 
-            if row_idx == n_rows - 2:
-                ax.set_xlabel("Time (seconds)", fontsize=7, color="#8b949e")
+            if row_i == n_rows - 2:
+                ax.set_xlabel("Time (seconds)", fontsize=7, color=C_TEXT)
 
-    # -----------------------------------------------------------------------
-    # Final-PnL bar chart (last row)
-    # -----------------------------------------------------------------------
-    for col_idx, (k_label, df) in enumerate(pnl_data.items()):
-        ax    = axes2[n_rows - 1][col_idx]
-        col_color = K_COLORS[col_idx % len(K_COLORS)]
+        # Final-PnL bar row
+        ax = axes[n_rows - 1][col_i]
+        ax.set_facecolor(BG_PANEL)
+        for sp in ax.spines.values(): sp.set_edgecolor(C_GRID)
 
-        final = (df.sort_values("time_sec")
-                   .groupby("agent")
-                   .last()
-                   .reset_index()[["agent", "role", "cumulative_pnl"]])
+        final = (df_p.sort_values("time_sec")
+                     .groupby("agent").last()
+                     .reset_index()[["agent","role","cumulative_pnl"]])
 
-        if final.empty:
-            ax.text(0.5, 0.5, "No data", ha="center", va="center",
-                    transform=ax.transAxes, color="#8b949e")
-        else:
-            bar_colors = [ROLE_COLORS.get(r, ["#58a6ff"])[0]
-                          for r in final["role"]]
+        if not final.empty:
+            bar_colors = [PALETTE.get(r,["#58a6ff"])[0] for r in final["role"]]
             bars = ax.bar(range(len(final)), final["cumulative_pnl"],
                           color=bar_colors, alpha=0.85,
-                          edgecolor="#30363d", linewidth=0.5)
+                          edgecolor=C_GRID, linewidth=0.5)
             ax.set_xticks(range(len(final)))
             ax.set_xticklabels(final["agent"], rotation=38,
-                               ha="right", fontsize=6, color="#8b949e")
-
-            # Value labels on bars
+                               ha="right", fontsize=6, color=C_TEXT)
             for bar, val in zip(bars, final["cumulative_pnl"]):
-                offset = abs(val) * 0.04 if val != 0 else 1
+                offset = abs(val)*0.04 if val != 0 else 1
                 va     = "bottom" if val >= 0 else "top"
                 y      = val + (offset if val >= 0 else -offset)
-                ax.text(bar.get_x() + bar.get_width() / 2, y,
+                ax.text(bar.get_x()+bar.get_width()/2, y,
                         f"{val:+.0f}", ha="center", va=va,
-                        color="#e6edf3", fontsize=6)
-
-            ax.axhline(0, color="#8b949e", linewidth=0.8)
+                        color=C_TITLE, fontsize=6)
+            ax.axhline(0, color=C_TEXT, linewidth=0.8)
             ax.yaxis.set_major_formatter(
                 mticker.FuncFormatter(lambda v, _: f"{v:+.0f}"))
 
-        ax.set_ylabel("Final PnL" if col_idx == 0 else "", color="#8b949e", fontsize=7)
-        ax.set_title(f"Final PnL — {k_label}", color=col_color, fontsize=9)
-        ax.grid(True, alpha=GRID_ALPHA, color="#8b949e", axis="y")
+        ax.set_title(f"Final PnL — {label}", color=col_color, fontsize=9)
+        ax.set_ylabel("Final PnL" if col_i == 0 else "", color=C_TEXT, fontsize=7)
+        ax.grid(True, alpha=GRID_A, color=C_TEXT, axis="y")
 
-    # Figure-level legend
-    legend_handles = [
-        mpatches.Patch(color=ROLE_COLORS["MarketMaker"][0],  label="Market Maker"),
-        mpatches.Patch(color=ROLE_COLORS["RetailTrader"][0], label="Retail Trader"),
-        mpatches.Patch(color=ROLE_COLORS["HFTSniper"][0],    label="HFT Sniper"),
-        mpatches.Patch(color=ROLE_COLORS["Whale"][0],        label="Whale"),
+    # Figure legend
+    leg_handles = [
+        mpatches.Patch(color=PALETTE[r][0], label=ROLES_LABELS[r])
+        for r in roles_to_plot if r in PALETTE
     ]
     if whale_times:
-        legend_handles.append(
+        leg_handles.append(
             mlines.Line2D([], [], color=WHALE_COLOR, linestyle="--",
                           linewidth=0.9, label="Whale sweep"))
+    fig.legend(handles=leg_handles, loc="upper right",
+               facecolor=BG_PANEL, edgecolor=C_GRID,
+               labelcolor=C_TITLE, fontsize=8)
 
-    fig2.legend(handles=legend_handles, loc="upper right",
-                facecolor="#161b22", edgecolor="#30363d",
-                labelcolor="#e6edf3", fontsize=8)
-
-    fig2.suptitle(
-        "Agent PnL by Role — Effect of Heat-Function Curvature k\n"
-        "PnL = Σ fill_qty × (mid − fill_price) for buys,  (fill_price − mid) for sells\n"
-        "Positive = filled better than fair value (passive) | Negative = paid away from fair value (aggressive)",
-        color="#e6edf3", fontsize=10, y=1.002)
-
-    plt.figure(fig2.number)
-    plt.tight_layout()
-    fig2.savefig("pnl_comparison.png", dpi=150, bbox_inches="tight",
-                 facecolor=fig2.get_facecolor())
-    print("Saved: pnl_comparison.png")
+    fig.suptitle(
+        "Agent PnL — Cumulative mark-to-mid PnL over simulation\n"
+        "PnL = Σ fill_qty × (mid−price) buys  /  (price−mid) sells",
+        color=C_TITLE, fontsize=10, y=1.002)
+    save(fig, "agent_pnl.png")
 
 
-# ===========================================================================
-# Show both figures
-# ===========================================================================
+# ============================================================================
+# Done
+# ============================================================================
+
+print("\n=== Charts produced ===")
+for f in ["sweep_stability.png","sweep_pnl.png",
+          "compare_stability.png","compare_pnl.png",
+          "dashboard.png","agent_pnl.png"]:
+    if Path(f).exists():
+        print(f"  {f}")
+
 plt.show()
