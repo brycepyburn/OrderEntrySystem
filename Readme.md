@@ -1,12 +1,14 @@
 # Order Entry System & Hybrid Matching Engine
 
-This repo is forked from our group's original project repo. The project, sponsored by Millennium, was to design an Order Entry System and Matching Engine. The underlying system is a C++ matching engine that utilizes a central limit order book with continuous matching, designed to minimize latency. My primary contributions to the project centered around the logic / simulation design / algorithm design of the matching engine, specifically the order allocation method. The software implementation was entirely handled by my teammates.
+This repo is forked from our group's original project repo. The project, sponsored by Millennium, was to design an order entry system and matching engine. The underlying system is a C++ matching engine that utilizes a central limit order book with continuous matching, designed to minimize latency. My primary contributions to the project centered around the logic / simulation design / algorithm design of the matching engine, specifically the order allocation method. The software implementation was entirely handled by my teammates.
 
-[**Link to Final Presentation**](Final Presentation)
+[**Link to Final Presentation**](Final_Presentation.pdf)
 
 ## Hybrid Order Allocation
 
-A standard FIFO allocation incentivizes rapid price finding but does not incentivize order book depth, while Pro Rata methods incentivize high-volume orders at the cost of speed / price finding. I built a hybrid allocation algorithm that decides percentage breakdown between FIFO and Pro Rata based on real-time market stability.
+A standard FIFO allocation incentivizes rapid price finding but does not incentivize order book depth, while Pro Rata methods incentivize high-volume orders at the cost of speed / price finding. I built a hybrid allocation algorithm that decides percentage breakdown between FIFO and Pro Rata based on real-time market stability. In our testing, this hybrid allocation system provided a more stable book, on average, than the pure-FIFO model utilized by major exchanges such as NASDAQ:
+
+[**Book Stability Comparison**](sweep_stability.png)
 
 ### Stability Metric
 Market stability is calculated using three continuous variables:
@@ -39,4 +41,7 @@ Several agents of varying levels of precision regarding true fair value (given d
 * **Retail:** Noisy + uninformed. Submits frequent small market orders and occasional aggressive limit orders (momentum traders).
 * **Whale:** Executes massive 3000-lot market sweeps every 10-20 seconds to intentionally stress test book depth. These orders have no price limit and consume liquidity until filled.
 
-* [**View Latency & Stress Test Results**](#) *(Link here in a sec)*
+Latency results, as well as agent performance graphics, can be found below:
+* [**Latency Results**](latency_results_full_rate.png)
+* [**Agent PNL Results**](sweep_pnl.png)
+
