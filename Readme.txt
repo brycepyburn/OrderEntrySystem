@@ -1,3 +1,0 @@
-# Order entry system
-
-Test
